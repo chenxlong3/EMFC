@@ -291,15 +291,22 @@ public:
     }
 
     /// Write influence result (for evaluation)
-    static void WriteInfluence(const std::string& outFileName, const double influence, const size_t numV, const std::string& resultFolder)
+    static void WriteInfluence(
+        const std::string& outFileName,
+        const double influence,
+        const double totalNodeBenefit,
+        const std::string& resultFolder)
     {
         mkdir_absence(resultFolder.c_str());
         std::ofstream outFile(resultFolder + "/eval_" + outFileName);
 
         if (outFile.is_open())
         {
-            const double ratio = (numV == 0) ? 0.0 : (influence / static_cast<double>(numV));
+            const double ratio = (totalNodeBenefit <= 0.0)
+                ? 0.0
+                : (influence / totalNodeBenefit);
             outFile << "Influence: " << influence << std::endl;
+            outFile << "TotalNodeBenefit: " << totalNodeBenefit << std::endl;
             outFile << "Ratio: " << ratio << std::endl;
             outFile.close();
             std::cout << "Evaluation result saved to: " << resultFolder + "/eval_" + outFileName << std::endl;
@@ -307,6 +314,154 @@ public:
         else
         {
             std::cout << "Failed to write evaluation result" << std::endl;
+        }
+    }
+
+    /// Save FRIM xi vector (one value per line), mirroring WriteOrderSeeds layout.
+    static void WriteFrimXi(
+        const std::string& outFileName,
+        const std::vector<double>& xi,
+        const std::string& resultFolder)
+    {
+        mkdir_absence(resultFolder.c_str());
+        const auto outpath = resultFolder + "/xi";
+        mkdir_absence(outpath.c_str());
+        const std::string filepath = outpath + "/xi_" + outFileName;
+        std::ofstream outFile(filepath);
+
+        for (size_t i = 0; i < xi.size(); i++)
+        {
+            outFile << xi[i] << '\n';
+        }
+
+        outFile.close();
+        std::cout << "Saved xi to: " << filepath << std::endl;
+    }
+
+    static bool readFrimXiFile(
+        const std::string& resultFolder,
+        const std::string& outFileName,
+        std::vector<double>& xi)
+    {
+        const std::string filepath = resultFolder + "/xi/xi_" + outFileName;
+        std::ifstream inFile(filepath);
+        if (!inFile.is_open())
+        {
+            return false;
+        }
+
+        xi.clear();
+        double val = 0.0;
+        while (inFile >> val)
+        {
+            xi.push_back(val);
+        }
+        inFile.close();
+        return true;
+    }
+
+    /// Load xi into global-style storage; returns false if file is missing or size mismatches.
+    static bool LoadFrimXiData(
+        const std::string& resultFolder,
+        const std::string& outFileName,
+        FrimXiData& out,
+        size_t expectedSize)
+    {
+        out.xi.clear();
+        out.J_hat = 0.0;
+        out.J_method_rr = 0.0;
+        out.J_method_mc = 0.0;
+        out.loaded = false;
+
+        if (!readFrimXiFile(resultFolder, outFileName, out.xi))
+        {
+            return false;
+        }
+
+        if (out.xi.size() != expectedSize)
+        {
+            std::cout << "Error: xi size " << out.xi.size()
+                      << " != graph size " << expectedSize << std::endl;
+            return false;
+        }
+
+        const std::string infoPath = resultFolder + "/info/" + outFileName;
+        std::ifstream infoFile(infoPath);
+        if (infoFile.is_open())
+        {
+            std::string line;
+            while (std::getline(infoFile, line))
+            {
+                if (line.find("J_hat:") == 0)
+                    out.J_hat = std::stod(line.substr(7));
+                else if (line.find("J_method_rr:") == 0)
+                    out.J_method_rr = std::stod(line.substr(13));
+                else if (line.find("J_method_mc:") == 0)
+                    out.J_method_mc = std::stod(line.substr(13));
+            }
+            infoFile.close();
+        }
+
+        out.loaded = true;
+        std::cout << "Loaded xi: size = " << out.xi.size() << std::endl;
+        return true;
+    }
+
+    /// Save FRIM summary info, mirroring WriteResult layout.
+    static void WriteFrimInfo(
+        const std::string& outFileName,
+        double J_hat,
+        double J_method_rr,
+        double J_method_mc,
+        double J_method_mc_naive,
+        double J_method_rr_naive,
+        size_t seedCount,
+        const FrimRunInfo& runInfo,
+        const std::string& resultFolder)
+    {
+        std::cout << "   --------------------" << std::endl;
+        std::cout << "  |J_hat: " << J_hat << std::endl;
+        std::cout << "  |J_method_rr: " << J_method_rr << std::endl;
+        std::cout << "  |J_method_rr_naive: " << J_method_rr_naive << std::endl;
+        std::cout << "  |J_method_mc: " << J_method_mc << std::endl;
+        std::cout << "  |J_method_mc_naive: " << J_method_mc_naive << std::endl;
+        std::cout << "  |E[|seeds|] sum q: " << seedCount << std::endl;
+        std::cout << "  |method: " << runInfo.method << std::endl;
+        std::cout << "  |time_total_sec: " << runInfo.time_total_sec << std::endl;
+        std::cout << "  |time_sample_sec: " << runInfo.time_sample_sec << std::endl;
+        std::cout << "  |time_solve_sec: " << runInfo.time_solve_sec << std::endl;
+        std::cout << "  |time_estimate_sec: " << runInfo.time_estimate_sec << std::endl;
+        std::cout << "   --------------------" << std::endl;
+
+        mkdir_absence(resultFolder.c_str());
+        const auto outpath = resultFolder + "/info";
+        mkdir_absence(outpath.c_str());
+        std::ofstream outFile(outpath + "/" + outFileName);
+
+        if (outFile.is_open())
+        {
+            outFile << "J_hat: " << J_hat << std::endl;
+            outFile << "J_method_rr: " << J_method_rr << std::endl;
+            outFile << "J_method_rr_naive: " << J_method_rr_naive << std::endl;
+            outFile << "J_method_mc: " << J_method_mc << std::endl;
+            outFile << "J_method_mc_naive: " << J_method_mc_naive << std::endl;
+            outFile << "E[|seeds|] sum q: " << seedCount << std::endl;
+            outFile << "method: " << runInfo.method << std::endl;
+            outFile << "rand_seed: " << runInfo.rand_seed << std::endl;
+            outFile << "num_v: " << runInfo.num_v << std::endl;
+            outFile << "num_rr: " << runInfo.num_rr << std::endl;
+            outFile << "num_mc: " << runInfo.num_mc << std::endl;
+            outFile << "max_sweeps: " << runInfo.max_sweeps << std::endl;
+            outFile << "sweeps_completed: " << runInfo.sweeps_completed << std::endl;
+            outFile << "xi_lo: " << runInfo.xi_lo << std::endl;
+            outFile << "num_xi_one: " << runInfo.num_xi_one << std::endl;
+            outFile << "num_xi_lo: " << runInfo.num_xi_lo << std::endl;
+            outFile << "time_total_sec: " << runInfo.time_total_sec << std::endl;
+            outFile << "time_sample_sec: " << runInfo.time_sample_sec << std::endl;
+            outFile << "time_solve_sec: " << runInfo.time_solve_sec << std::endl;
+            outFile << "time_estimate_sec: " << runInfo.time_estimate_sec << std::endl;
+            outFile.close();
+            std::cout << "Saved FRIM info to: " << outpath + "/" + outFileName << std::endl;
         }
     }
 };

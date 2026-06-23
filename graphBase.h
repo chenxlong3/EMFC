@@ -48,6 +48,8 @@ public:
 
         TauAssignMode tau_mode = TauAssignMode::EXPONENTIAL_NORM;
         double tau_exponential_scale = 1.0;
+        double tau_lo = 1.0;
+        double tau_hi = 5.0;
 
         double lam_unirand_lo = 0.1;
         double lam_unirand_hi = 0.5;
@@ -286,11 +288,15 @@ public:
     static void assignTau(const NodeHyperParamsConfig& config, NodeHyperParams& params)
     {
         const size_t n = params.tau.size();
+        const double tau_span = config.tau_hi - config.tau_lo;
         switch (config.tau_mode)
         {
         case TauAssignMode::UNIFORM_0_1:
             for (size_t i = 0; i < n; i++)
-                params.tau[i] = dsfmt_gv_genrand_close_open();
+            {
+                const double u = dsfmt_gv_genrand_close_open();
+                params.tau[i] = config.tau_lo + tau_span * u;
+            }
             break;
         case TauAssignMode::EXPONENTIAL_NORM:
         {
@@ -310,6 +316,9 @@ public:
             {
                 std::fill(tau_samples.begin(), tau_samples.end(), 0.0);
             }
+
+            for (size_t i = 0; i < n; i++)
+                tau_samples[i] = config.tau_lo + tau_span * tau_samples[i];
 
             std::sort(tau_samples.begin(), tau_samples.end(), std::greater<double>());
 
@@ -658,6 +667,18 @@ public:
         }
 
         return inf;
+    }
+
+    /// Sample a seed set S₀: include u iff U(0,1) <= q[u] (one draw per node).
+    static Nodelist sampleSeedSetFromQ(const std::vector<double>& q)
+    {
+        Nodelist seeds;
+        for (size_t u = 0; u < q.size(); u++)
+        {
+            if (dsfmt_gv_genrand_open_close() <= q[u])
+                seeds.push_back(static_cast<uint32_t>(u));
+        }
+        return seeds;
     }
 
     /// MC benefit evaluation: sample seeds from q, propagate with IC/LT,
