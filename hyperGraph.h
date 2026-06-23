@@ -23,6 +23,8 @@ private:
     double _wrrNormConst = 0.0;
     
     size_t _hit = 0;
+    size_t _frimNumRR = 0;
+    std::vector<double> _frimRRweights;
     double _numSamplesEval = 0;
     double _hyperedgeAvgEval = 0.0;
 
@@ -57,7 +59,7 @@ private:
     {
         _numV = (uint32_t)_graph.size();
         _vecOutdeg = std::vector<uint32_t>(_numV, 0);
-        _nodeGain = std::vector<double>(_numV, 0.0);
+        _nodeGain = std::vector<double>(_numV + 1, 0.0);
         _numE = 0;
         for (auto& nbrs : _graph) {
             _numE += nbrs.size();
@@ -110,8 +112,8 @@ private:
         assert(_cumDeg[_numV-1] == (_numV + _numE));
         assert(_cumInDeg[_numV-1] == _numE);
         updateWrrNormConst();
-        _FRsets = FRsets(_numV);
-        _vecVisitBool = std::vector<bool>(_numV);
+        _FRsets = FRsets(_numV + 1);
+        _vecVisitBool = std::vector<bool>(_numV + 1);
         _vecVisitNode = Nodelist(_numV);
     }
 
@@ -510,6 +512,161 @@ public:
         }
     } 
 
+    // ===== FRIM RR-set tracking (dummy node index = _numV) =====
+    void FrimClearRRTracking()
+    {
+        for (auto i = _numV; i--;)
+            FRset().swap(_FRsets[i]);
+        FRset().swap(_FRsets[_numV]);
+
+        _frimNumRR = 0;
+        _frimRRweights.clear();
+    }
+
+    void FrimRegisterRRSample(const std::vector<uint32_t>& rr_nodes, double weight)
+    {
+        const size_t hyperIdx = _frimNumRR++;
+        _frimRRweights.push_back(weight);
+
+        for (uint32_t x : rr_nodes)
+        {
+            if (x < _numV)
+                _FRsets[x].push_back(hyperIdx);
+        }
+
+        if (weight > 0.0)
+            _FRsets[_numV].push_back(hyperIdx);
+    }
+
+    double FrimEstimateJFromDummy(double root_weight_sum, size_t num_rr) const
+    {
+        if (num_rr == 0 || root_weight_sum <= 0.0)
+            return 0.0;
+
+        double total = 0.0;
+        for (size_t idx : _FRsets[_numV])
+            total += _frimRRweights[idx];
+        return (root_weight_sum / static_cast<double>(num_rr)) * total;
+    }
+
+    /// Reverse BFS RR-set: root skips xi; other nodes draw xi once per sample (cached);
+    /// xi-fail nodes are never enqueued; q hit stops.
+    FrimRRSample BuildOneFrimRRSample(
+        const uint32_t v_root,
+        const std::vector<double>& q,
+        const std::vector<double>& xi) const
+    {
+        FrimRRSample sample;
+        sample.root = v_root;
+        sample.hit = false;
+        sample.rr_nodes.clear();
+
+        std::vector<uint8_t> visited(_numV, 0);
+        // -1 unknown, 0 fail, 1 pass (one xi coin per node per RR-set)
+        std::vector<int8_t> xi_pass(_numV, -1);
+        std::queue<uint32_t> bfs_q;
+
+        auto resolveXiPass = [&](uint32_t node) -> bool
+        {
+            if (node == v_root)
+                return true;
+            if (node >= xi.size())
+                return false;
+            if (xi_pass[node] >= 0)
+                return xi_pass[node] == 1;
+            const bool pass = dsfmt_gv_genrand_close_open() <= xi[node];
+            xi_pass[node] = pass ? 1 : 0;
+            return pass;
+        };
+
+        visited[v_root] = 1;
+        bfs_q.push(v_root);
+
+        while (!bfs_q.empty())
+        {
+            const uint32_t u = bfs_q.front();
+            bfs_q.pop();
+
+            if (u != v_root && !resolveXiPass(u))
+                continue;
+
+            sample.rr_nodes.push_back(u);
+
+            if (u < q.size() && dsfmt_gv_genrand_open_close() <= q[u])
+            {
+                sample.hit = true;
+                break;
+            }
+
+            for (const auto& nbr : _graph[u])
+            {
+                const uint32_t pred = nbr.first;
+                if (visited[pred])
+                    continue;
+                if (dsfmt_gv_genrand_open_close() > nbr.second)
+                    continue;
+                if (pred != v_root && !resolveXiPass(pred))
+                    continue;
+
+                visited[pred] = 1;
+                bfs_q.push(pred);
+            }
+        }
+
+        return sample;
+    }
+
+    /// Reverse BFS without xi: save tree + per-node xi_gate for CRN re-evaluation.
+    FrimRRStructureSample BuildOneFrimRRStructure(
+        const uint32_t v_root,
+        const std::vector<double>& q) const
+    {
+        FrimRRStructureSample sample;
+        sample.root = v_root;
+        sample.hit = false;
+        sample.hit_node = 0;
+        sample.parent.assign(_numV, UINT32_MAX);
+        sample.xi_gate.assign(_numV, -1.0f);
+
+        std::vector<uint8_t> visited(_numV, 0);
+        std::queue<uint32_t> bfs_q;
+
+        visited[v_root] = 1;
+        sample.xi_gate[v_root] = 0.0f;
+        sample.bfs_order.push_back(v_root);
+        bfs_q.push(v_root);
+
+        while (!bfs_q.empty())
+        {
+            const uint32_t u = bfs_q.front();
+            bfs_q.pop();
+
+            if (u < q.size() && dsfmt_gv_genrand_open_close() <= q[u])
+            {
+                sample.hit = true;
+                sample.hit_node = u;
+                break;
+            }
+
+            for (const auto& nbr : _graph[u])
+            {
+                const uint32_t pred = nbr.first;
+                if (visited[pred])
+                    continue;
+                if (dsfmt_gv_genrand_open_close() > nbr.second)
+                    continue;
+
+                visited[pred] = 1;
+                sample.parent[pred] = u;
+                sample.xi_gate[pred] = static_cast<float>(dsfmt_gv_genrand_close_open());
+                sample.bfs_order.push_back(pred);
+                bfs_q.push(pred);
+            }
+        }
+
+        return sample;
+    }
+
     // Generate one RR set
     void BuildOneRRset(const uint32_t uStart, const size_t hyperIdx)
     {
@@ -888,13 +1045,14 @@ postProcess:
             RRsets().swap(_RRsets);
 
             for (auto i = _numV; i--;)
-            {
                 FRset().swap(_FRsets[i]);
-            }
+            FRset().swap(_FRsets[_numV]);
         }
 
         _numRRsets = 0;
         _hit = 0;
+        _frimNumRR = 0;
+        _frimRRweights.clear();
     }
 
     // Release memory

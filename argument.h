@@ -67,6 +67,10 @@ public:
     bool _scaleN = false;
     // For evaluation
     std::string _method = "";
+    bool _eval_xi_const_set = false;
+    bool _eval_xi_half_set = false;
+    double _eval_xi_const = 1.0;
+    uint32_t _eval_mc = 10000;
 
     // sample RR set with the vanilla method
     bool _vanilla = false;
@@ -89,6 +93,12 @@ public:
     double _activeQVar = 1.0;
     double _inactiveQMean = 0.2;
     double _inactiveQVar = 1.0;
+
+    // FRIM xi selection
+    double _xi_lo = 0.5;
+    size_t _frim_rr = 10000;
+    size_t _frim_mc = 1000;
+    int _frim_max_sweeps = 10;
 
     Argument(int argc, char* argv[])
     {
@@ -121,6 +131,30 @@ public:
             else if (!param.compare("-advanced")) _advanced = (value == "1");
             else if (!param.compare("-rand_seed")) _rand_seed = stoi(value);
             else if (!param.compare("-method")) _method = value;
+            else if (!param.compare("-eval_xi"))
+            {
+                if (value == "half")
+                {
+                    _eval_xi_half_set = true;
+                    _eval_xi_const_set = true;
+                }
+                else if (value == "ones" || value == "1")
+                {
+                    _eval_xi_const = 1.0;
+                    _eval_xi_const_set = true;
+                }
+                else if (value == "lo")
+                {
+                    _eval_xi_const = _xi_lo;
+                    _eval_xi_const_set = true;
+                }
+                else
+                {
+                    _eval_xi_const = stod(value);
+                    _eval_xi_const_set = true;
+                }
+            }
+            else if (!param.compare("-eval_mc")) _eval_mc = static_cast<uint32_t>(stoul(value));
             else if (!param.compare("-alpha")) _alpha = stof(value);
             else if (!param.compare("-decay_mode")) _decay_mode = value;
             else if (!param.compare("-scaleN")) _scaleN = (value == "1");
@@ -134,6 +168,10 @@ public:
             else if (!param.compare("-active_q_var")) _activeQVar = stod(value);
             else if (!param.compare("-inactive_q_mean")) _inactiveQMean = stod(value);
             else if (!param.compare("-inactive_q_var")) _inactiveQVar = stod(value);
+            else if (!param.compare("-xi_lo")) _xi_lo = stod(value);
+            else if (!param.compare("-frim_rr")) _frim_rr = static_cast<size_t>(stoull(value));
+            else if (!param.compare("-frim_mc")) _frim_mc = static_cast<size_t>(stoull(value));
+            else if (!param.compare("-frim_sweeps")) _frim_max_sweeps = stoi(value);
         }
 
         if (_wcVar <= 0)
@@ -266,6 +304,68 @@ public:
         return ;
     }
 
+    void build_frim_outfilename(FuncType func)
+    {
+        if (func == FRIM_RR)
+        {
+            _outFileName = _graphname + "_" + std::to_string(_rand_seed)
+                + "_frim_rr_" + _probDistStr + "_R" + std::to_string(_frim_rr);
+        }
+        else if (func == FRIM_RR_NAIVE)
+        {
+            _outFileName = _graphname + "_" + std::to_string(_rand_seed)
+                + "_frim_rr_naive_" + _probDistStr + "_R" + std::to_string(_frim_rr);
+        }
+        else if (func == FRIM_RR_CRN)
+        {
+            _outFileName = _graphname + "_" + std::to_string(_rand_seed)
+                + "_frim_rr_crn_" + _probDistStr + "_R" + std::to_string(_frim_rr);
+        }
+        else if (func == FRIM_MC)
+        {
+            _outFileName = _graphname + "_" + std::to_string(_rand_seed)
+                + "_frim_mc_" + _probDistStr + "_mc" + std::to_string(_frim_mc);
+        }
+        else if (func == FRIM_MC_NAIVE)
+        {
+            _outFileName = _graphname + "_" + std::to_string(_rand_seed)
+                + "_frim_mc_naive_" + _probDistStr + "_mc" + std::to_string(_frim_mc);
+        }
+        else
+        {
+            _outFileName = _graphname + "_" + std::to_string(_rand_seed) + "_frim_" + _probDistStr;
+        }
+    }
+
+    void build_eval_xi_half_outfilename()
+    {
+        _outFileName = _graphname + "_" + std::to_string(_rand_seed)
+            + "_xi_half_" + _probDistStr;
+    }
+
+    void build_eval_xi_const_outfilename(double xi_val)
+    {
+        std::ostringstream oss;
+        oss << xi_val;
+        _outFileName = _graphname + "_" + std::to_string(_rand_seed)
+            + "_xi" + oss.str() + "_" + _probDistStr;
+    }
+
+    FuncType decode_frim_eval_method() const
+    {
+        if (_method == "frim_rr" || _method == "FRIM_RR")
+            return FRIM_RR;
+        if (_method == "frim_rr_naive" || _method == "FRIM_RR_NAIVE")
+            return FRIM_RR_NAIVE;
+        if (_method == "frim_rr_crn" || _method == "FRIM_RR_CRN")
+            return FRIM_RR_CRN;
+        if (_method == "frim_mc" || _method == "FRIM_MC")
+            return FRIM_MC;
+        if (_method == "frim_mc_naive" || _method == "FRIM_MC_NAIVE")
+            return FRIM_MC_NAIVE;
+        return FUNC_ERROR;
+    }
+
     // Fill candedges and seeds filenames from Arg
     void build_cand_seeds_filenames() {
         this->_candedges_filename = this->_dir + "/" + "candEdges_" + this->_graphname + "_num" + std::to_string(this->_seedsize);
@@ -371,6 +471,26 @@ public:
         else if (_funcStr == "STAT" || _funcStr == "stat")
         {
             _func = STAT;
+        }
+        else if (_funcStr == "frim_rr" || _funcStr == "FRIM_RR")
+        {
+            _func = FRIM_RR;
+        }
+        else if (_funcStr == "frim_rr_naive" || _funcStr == "FRIM_RR_NAIVE")
+        {
+            _func = FRIM_RR_NAIVE;
+        }
+        else if (_funcStr == "frim_rr_crn" || _funcStr == "FRIM_RR_CRN")
+        {
+            _func = FRIM_RR_CRN;
+        }
+        else if (_funcStr == "frim_mc" || _funcStr == "FRIM_MC")
+        {
+            _func = FRIM_MC;
+        }
+        else if (_funcStr == "frim_mc_naive" || _funcStr == "FRIM_MC_NAIVE")
+        {
+            _func = FRIM_MC_NAIVE;
         }
         else
         {

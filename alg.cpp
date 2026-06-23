@@ -1564,3 +1564,1158 @@ double Alg::fixed_subsimW(const int targetSize, int num_samples)
     std::cout << "==>Time for weighted RR sets and greedy: " << time1 << ", " << time2 << '\n';
     return 0.0;
 }
+
+// ===== FRIM xi selection (implement-spec.md) =====
+
+std::vector<double> Alg::buildCumulativeWeights(const std::vector<double>& weights)
+{
+    std::vector<double> cum(weights.size(), 0.0);
+    double sum = 0.0;
+    for (size_t i = 0; i < weights.size(); i++)
+    {
+        sum += std::max(0.0, weights[i]);
+        cum[i] = sum;
+    }
+    return cum;
+}
+
+uint32_t Alg::sampleByCumulativeWeights(const std::vector<double>& cumWeights)
+{
+    if (cumWeights.empty())
+        return 0;
+    if (cumWeights.back() <= 0.0)
+        return dsfmt_gv_genrand_uint32_range(static_cast<uint32_t>(cumWeights.size()));
+
+    const double target = dsfmt_gv_genrand_close_open() * cumWeights.back();
+    if (target < cumWeights[0])
+        return 0;
+
+    int left = 0;
+    int right = static_cast<int>(cumWeights.size()) - 1;
+    while (left < right)
+    {
+        const int mid = left + (right - left) / 2;
+        if (cumWeights[mid] <= target)
+            left = mid + 1;
+        else
+            right = mid;
+    }
+    return static_cast<uint32_t>(left);
+}
+
+double Alg::nodeObjectiveValue(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& xi,
+    uint32_t nodeId)
+{
+    return tau[nodeId] * (1.0 - lam[nodeId] * xi[nodeId]);
+}
+
+static void frimFillXiStats(FrimXiResult& result, double xi_lo)
+{
+    size_t num_one = 0;
+    for (double x : result.xi)
+    {
+        if (x > 0.5)
+            num_one++;
+    }
+    result.run_info.num_xi_one = num_one;
+    result.run_info.num_xi_lo = result.xi.size() - num_one;
+    result.run_info.xi_lo = xi_lo;
+}
+
+static std::vector<double> frimRootSamplingWeights(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& xi)
+{
+    std::vector<double> weights(tau.size(), 0.0);
+    for (size_t v = 0; v < tau.size(); v++)
+    {
+        if (v < lam.size() && v < xi.size())
+            weights[v] = std::max(0.0, tau[v] * (1.0 - lam[v] * xi[v]));
+    }
+    return weights;
+}
+
+static double frimRootWeightSum(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& xi)
+{
+    double sum = 0.0;
+    for (size_t v = 0; v < tau.size(); v++)
+    {
+        if (v < lam.size() && v < xi.size())
+            sum += std::max(0.0, tau[v] * (1.0 - lam[v] * xi[v]));
+    }
+    return sum;
+}
+
+FrimRRSample Alg::frimSampleOneRR(
+    const std::vector<double>& cum_root_weights,
+    const std::vector<double>& q,
+    const std::vector<double>& xi) const
+{
+    const uint32_t v_root = sampleByCumulativeWeights(cum_root_weights);
+    return _hyperGraph.BuildOneFrimRRSample(v_root, q, xi);
+}
+
+FrimRRSample Alg::frimReverseBfsFirstHitRs(
+    uint32_t v_root,
+    const std::vector<double>& q,
+    const std::vector<double>& xi) const
+{
+    return _hyperGraph.BuildOneFrimRRSample(v_root, q, xi);
+}
+
+std::vector<FrimRRSample> Alg::frimBuildRRSamples(
+    size_t num_rr,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi) const
+{
+    std::vector<FrimRRSample> samples;
+    samples.reserve(num_rr);
+    const std::vector<double> cumRoot =
+        buildCumulativeWeights(frimRootSamplingWeights(tau, lam, xi));
+
+    for (size_t r = 0; r < num_rr; r++)
+        samples.push_back(frimSampleOneRR(cumRoot, q, xi));
+    return samples;
+}
+
+double Alg::frimEstimateJ(
+    const std::vector<double>& xi,
+    const std::vector<double>& q,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    size_t num_rr)
+{
+    const double root_weight_sum = frimRootWeightSum(tau, lam, xi);
+    if (num_rr == 0 || root_weight_sum <= 0.0)
+        return 0.0;
+
+    _hyperGraph.FrimClearRRTracking();
+    const std::vector<double> cumRoot =
+        buildCumulativeWeights(frimRootSamplingWeights(tau, lam, xi));
+    for (size_t r = 0; r < num_rr; r++)
+    {
+        const FrimRRSample sample = frimSampleOneRR(cumRoot, q, xi);
+        const double weight = sample.hit ? 1.0 : 0.0;
+        _hyperGraph.FrimRegisterRRSample(sample.rr_nodes, weight);
+    }
+    return _hyperGraph.FrimEstimateJFromDummy(root_weight_sum, num_rr);
+}
+
+void Alg::frimMethodRR(
+    const std::vector<FrimRRSample>& samples,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    double root_weight_sum,
+    size_t num_rr,
+    double xi_lo,
+    std::vector<double>& xi,
+    std::vector<double>& alpha) const
+{
+    std::vector<double> K(_numV, 0.0);
+    std::vector<double> P(_numV, 0.0);
+
+    for (const auto& sample : samples)
+    {
+        if (!sample.hit)
+            continue;
+
+        const uint32_t v = sample.root;
+        const double coef = tau[v] * (1.0 - lam[v]);
+        for (uint32_t x : sample.rr_nodes)
+        {
+            P[x] += 1.0;
+            if (x != v)
+                K[x] += coef;
+        }
+    }
+
+    const double scale = root_weight_sum / static_cast<double>(num_rr);
+    xi.assign(_numV, xi_lo);
+    alpha.assign(_numV, 0.0);
+    for (size_t u = 0; u < _numV; u++)
+    {
+        K[u] *= scale;
+        P[u] *= scale;
+        alpha[u] = K[u] - tau[u] * lam[u] * P[u];
+        xi[u] = (alpha[u] > 0.0) ? 1.0 : xi_lo;
+    }
+}
+
+void Alg::frimComputeActive(
+    const FrimLiveEdgeSample& sample,
+    const std::vector<double>& q,
+    const std::vector<double>& xi,
+    std::vector<uint8_t>& active,
+    uint32_t silent_node) const
+{
+    active.assign(_numV, 0);
+    std::queue<uint32_t> que;
+    for (size_t u = 0; u < _numV; u++)
+    {
+        if (sample.seed_gates[u] > q[u])
+            continue;
+        active[u] = 1;
+        que.push(static_cast<uint32_t>(u));
+    }
+
+    while (!que.empty())
+    {
+        const uint32_t u = que.front();
+        que.pop();
+
+        if (u == silent_node)
+            continue;
+        if (sample.gates[u] > xi[u])
+            continue;
+
+        for (uint32_t v : sample.kept_out[u])
+        {
+            if (active[v])
+                continue;
+            active[v] = 1;
+            que.push(v);
+        }
+    }
+}
+
+std::vector<uint8_t> Alg::frimForwardReachFrom(
+    const FrimLiveEdgeSample& sample,
+    const std::vector<double>& xi,
+    uint32_t src) const
+{
+    std::vector<uint8_t> reached(_numV, 0);
+    if (src >= _numV || sample.gates[src] > xi[src])
+        return reached;
+
+    std::queue<uint32_t> q;
+    reached[src] = 1;
+    q.push(src);
+    while (!q.empty())
+    {
+        const uint32_t u = q.front();
+        q.pop();
+        if (sample.gates[u] > xi[u])
+            continue;
+
+        for (uint32_t v : sample.kept_out[u])
+        {
+            if (reached[v])
+                continue;
+            reached[v] = 1;
+            q.push(v);
+        }
+    }
+    return reached;
+}
+
+double Alg::frimObjectiveOnSample(
+    const FrimLiveEdgeSample& sample,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& xi) const
+{
+    double sum = 0.0;
+    for (size_t v = 0; v < _numV; v++)
+    {
+        if (sample.active[v])
+            sum += nodeObjectiveValue(tau, lam, xi, static_cast<uint32_t>(v));
+    }
+    return sum;
+}
+
+double Alg::frimFlipDelta(
+    const FrimLiveEdgeSample& sample,
+    const std::vector<double>& q,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& xi,
+    uint32_t u,
+    double xi_new) const
+{
+    if (u >= _numV || !sample.active[u])
+        return 0.0;
+
+    const double xi_old = xi[u];
+    if (std::abs(xi_old - xi_new) <= 0.0)
+        return 0.0;
+
+    double delta = 0.0;
+    if (xi_old > xi_new)
+    {
+        std::vector<uint8_t> active_minus;
+        frimComputeActive(sample, q, xi, active_minus, u);
+
+        for (size_t v = 0; v < _numV; v++)
+        {
+            if (sample.active[v] && !active_minus[v])
+                delta -= nodeObjectiveValue(tau, lam, xi, static_cast<uint32_t>(v));
+        }
+        delta += tau[u] * lam[u] * (xi_old - xi_new);
+    }
+    else
+    {
+        std::vector<double> xi_eff = xi;
+        xi_eff[u] = xi_new;
+        const std::vector<uint8_t> reached = frimForwardReachFrom(sample, xi_eff, u);
+        for (size_t v = 0; v < _numV; v++)
+        {
+            if (reached[v] && !sample.active[v])
+                delta += nodeObjectiveValue(tau, lam, xi, static_cast<uint32_t>(v));
+        }
+        delta += tau[u] * lam[u] * (xi_old - xi_new);
+    }
+    return delta;
+}
+
+void Alg::frimApplyFlip(
+    FrimLiveEdgeSample& sample,
+    const std::vector<double>& q,
+    const std::vector<double>& xi,
+    uint32_t u,
+    double xi_new,
+    double xi_lo) const
+{
+    if (u >= _numV || !sample.active[u])
+        return;
+
+    if (std::abs(xi_new - xi_lo) <= 0.0)
+    {
+        frimComputeActive(sample, q, xi, sample.active, u);
+    }
+    else
+    {
+        const std::vector<uint8_t> reached = frimForwardReachFrom(sample, xi, u);
+        for (size_t v = 0; v < _numV; v++)
+        {
+            if (reached[v])
+                sample.active[v] = 1;
+        }
+    }
+}
+
+FrimXiResult Alg::frimMethodMC(
+    const Graph& forwardGraph,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_mc,
+    int max_sweeps,
+    double delta_tol) const
+{
+    FrimXiResult result;
+    result.xi = xi_init;
+
+    if (_numV == 0 || num_mc == 0 || q.size() != _numV)
+        return result;
+
+    Timer timer;
+    std::vector<FrimLiveEdgeSample> live_samples;
+    live_samples.reserve(num_mc);
+    for (size_t r = 0; r < num_mc; r++)
+    {
+        FrimLiveEdgeSample sample;
+        sample.kept_out.assign(forwardGraph.size(), {});
+        sample.gates.assign(_numV, 0.0);
+        for (size_t u = 0; u < forwardGraph.size(); u++)
+        {
+            for (const auto& edge : forwardGraph[u])
+            {
+                if (dsfmt_gv_genrand_open_close() <= edge.second)
+                    sample.kept_out[u].push_back(edge.first);
+            }
+        }
+        for (size_t i = 0; i < _numV; i++)
+            sample.gates[i] = dsfmt_gv_genrand_close_open();
+        sample.seed_gates.assign(_numV, 0.0);
+        for (size_t i = 0; i < _numV; i++)
+            sample.seed_gates[i] = dsfmt_gv_genrand_open_close();
+
+        frimComputeActive(sample, q, result.xi, sample.active);
+        live_samples.push_back(std::move(sample));
+    }
+    result.run_info.time_sample_sec = timer.get_operation_time();
+
+    double J_hat = 0.0;
+    for (const auto& sample : live_samples)
+        J_hat += frimObjectiveOnSample(sample, tau, lam, result.xi);
+    J_hat /= static_cast<double>(num_mc);
+
+    std::vector<uint32_t> order(_numV);
+    std::iota(order.begin(), order.end(), 0U);
+    int sweeps_completed = 0;
+    for (int sweep = 0; sweep < max_sweeps; sweep++)
+    {
+        sweeps_completed++;
+        bool improved = false;
+        for (size_t i = _numV - 1; i > 0; i--)
+        {
+            const size_t j = dsfmt_gv_genrand_uint32_range(static_cast<uint32_t>(i + 1));
+            std::swap(order[i], order[j]);
+        }
+
+        for (uint32_t u : order)
+        {
+            const double xi_new = (result.xi[u] > 0.5) ? xi_lo : 1.0;
+            if (std::abs(result.xi[u] - xi_new) <= 0.0)
+                continue;
+
+            double delta = 0.0;
+            for (const auto& sample : live_samples)
+                delta += frimFlipDelta(sample, q, tau, lam, result.xi, u, xi_new);
+            delta /= static_cast<double>(num_mc);
+
+            if (delta > delta_tol)
+            {
+                result.xi[u] = xi_new;
+                for (auto& sample : live_samples)
+                    frimApplyFlip(sample, q, result.xi, u, xi_new, xi_lo);
+                J_hat += delta;
+                improved = true;
+            }
+        }
+
+        if (!improved)
+            break;
+    }
+    result.run_info.time_solve_sec = timer.get_operation_time();
+    result.run_info.sweeps_completed = sweeps_completed;
+    result.run_info.max_sweeps = max_sweeps;
+
+    result.J_method_mc = J_hat;
+    result.run_info.time_total_sec = timer.get_total_time();
+    return result;
+}
+
+FrimXiResult Alg::frim_solve_rr(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    double xi_lo,
+    size_t num_rr)
+{
+    FrimXiResult result;
+    if (_numV == 0 || tau.size() != _numV || lam.size() != _numV || q.size() != _numV)
+        return result;
+
+    double tau_sum = 0.0;
+    for (double t : tau)
+        tau_sum += t;
+    if (tau_sum <= 0.0)
+        return result;
+
+    std::cout << "[FRIM-RR] sampling " << num_rr
+              << " tau*(1-lambda*xi)-weighted RR paths (random seed)..." << std::endl;
+    Timer timer;
+    const std::vector<double> xi_all_one(_numV, 1.0);
+    const std::vector<FrimRRSample> rr_samples =
+        frimBuildRRSamples(num_rr, tau, lam, q, xi_all_one);
+    const double root_weight_sum = frimRootWeightSum(tau, lam, xi_all_one);
+    result.run_info.time_sample_sec = timer.get_operation_time();
+    frimMethodRR(rr_samples, tau, lam, q, root_weight_sum, num_rr, xi_lo, result.xi, result.alpha);
+    result.run_info.time_solve_sec = timer.get_operation_time();
+    result.J_method_rr = frimEstimateJ(result.xi, q, tau, lam, num_rr);
+    result.run_info.time_estimate_sec = timer.get_operation_time();
+    result.J_hat = result.J_method_rr;
+    result.run_info.time_total_sec = timer.get_total_time();
+    std::cout << "[FRIM-RR] done: J_hat=" << result.J_method_rr << std::endl;
+
+    frimFillXiStats(result, xi_lo);
+    size_t num_xi_one = result.run_info.num_xi_one;
+    std::cout << "[FRIM-RR] xi: " << num_xi_one << " nodes at 1, "
+              << (_numV - num_xi_one) << " nodes at " << xi_lo << std::endl;
+    return result;
+}
+
+FrimXiResult Alg::frimMethodRRNaive(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_rr,
+    int max_sweeps,
+    double delta_tol)
+{
+    FrimXiResult result;
+    result.xi = xi_init;
+
+    if (_numV == 0 || num_rr == 0 || q.size() != _numV
+        || tau.size() != _numV || lam.size() != _numV)
+        return result;
+
+    const double root_weight_sum = frimRootWeightSum(tau, lam, result.xi);
+    if (root_weight_sum <= 0.0)
+        return result;
+
+    Timer timer;
+    // Estimator: tau*(1-lam*xi) root sampling, hit weight 1; fresh R samples per J call.
+    result.J_hat = frimEstimateJ(result.xi, q, tau, lam, num_rr);
+    result.run_info.time_sample_sec = timer.get_operation_time();
+    std::cout << "[FRIM-RR-naive] initial J_hat=" << result.J_hat
+              << " (tau*(1-lam*xi) root, hit=1, R=" << num_rr << ")"
+              << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+    int sweeps_completed = 0;
+    for (int sweep = 0; sweep < max_sweeps; sweep++)
+    {
+        sweeps_completed++;
+        bool improved = false;
+        std::vector<uint32_t> order(_numV);
+        std::iota(order.begin(), order.end(), 0U);
+        for (size_t i = _numV - 1; i > 0; i--)
+        {
+            const size_t j = dsfmt_gv_genrand_uint32_range(static_cast<uint32_t>(i + 1));
+            std::swap(order[i], order[j]);
+        }
+
+        std::cout << "[FRIM-RR-naive] sweep " << (sweep + 1) << "/" << max_sweeps
+                  << " start, J_hat=" << result.J_hat
+                  << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+        uint32_t currProgress = 0;
+        size_t node_idx = 0;
+        size_t updates_this_sweep = 0;
+        for (uint32_t u : order)
+        {
+            node_idx++;
+            if (node_idx * 100 >= _numV * currProgress)
+            {
+                std::cout << "[FRIM-RR-naive] sweep " << (sweep + 1) << "/" << max_sweeps
+                          << " nodes " << currProgress << "%, updates=" << updates_this_sweep
+                          << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+                currProgress += 20;
+            }
+
+            std::vector<double> xi_at_lo = result.xi;
+            std::vector<double> xi_at_one = result.xi;
+            xi_at_lo[u] = xi_lo;
+            xi_at_one[u] = 1.0;
+
+            const double J_lo = frimEstimateJ(xi_at_lo, q, tau, lam, num_rr);
+            const double J_one = frimEstimateJ(xi_at_one, q, tau, lam, num_rr);
+
+            const double xi_pick =
+                (J_one > J_lo + delta_tol) ? 1.0
+                : (J_lo > J_one + delta_tol) ? xi_lo
+                : (J_one >= J_lo ? 1.0 : xi_lo);
+
+            if (std::abs(result.xi[u] - xi_pick) > 0.0)
+            {
+                result.xi[u] = xi_pick;
+                improved = true;
+                updates_this_sweep++;
+            }
+        }
+
+        result.J_hat = frimEstimateJ(result.xi, q, tau, lam, num_rr);
+        std::cout << "[FRIM-RR-naive] sweep " << (sweep + 1) << "/" << max_sweeps
+                  << " done: updates=" << updates_this_sweep
+                  << ", improved=" << (improved ? "yes" : "no")
+                  << ", J_hat=" << result.J_hat
+                  << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+        if (!improved)
+            break;
+    }
+
+    result.run_info.time_solve_sec = timer.get_operation_time();
+    result.run_info.sweeps_completed = sweeps_completed;
+    result.run_info.max_sweeps = max_sweeps;
+    result.J_method_rr_naive = frimEstimateJ(result.xi, q, tau, lam, num_rr);
+    result.J_hat = result.J_method_rr_naive;
+    result.run_info.time_total_sec = timer.get_total_time();
+    return result;
+}
+
+static double frimTauSum(const std::vector<double>& tau)
+{
+    double sum = 0.0;
+    for (double t : tau)
+        sum += std::max(0.0, t);
+    return sum;
+}
+
+FrimRRStructureSample Alg::frimBuildOneRRStructure(
+    const std::vector<double>& cum_tau,
+    const std::vector<double>& q) const
+{
+    const uint32_t v_root = sampleByCumulativeWeights(cum_tau);
+    return _hyperGraph.BuildOneFrimRRStructure(v_root, q);
+}
+
+std::vector<FrimRRStructureSample> Alg::frimBuildRRStructureSamples(
+    size_t num_rr,
+    const std::vector<double>& tau,
+    const std::vector<double>& q) const
+{
+    std::vector<FrimRRStructureSample> samples;
+    samples.reserve(num_rr);
+    const std::vector<double> cumTau = buildCumulativeWeights(tau);
+    for (size_t r = 0; r < num_rr; r++)
+        samples.push_back(frimBuildOneRRStructure(cumTau, q));
+    return samples;
+}
+
+double Alg::frimRRStructureSampleWeight(
+    const FrimRRStructureSample& sample,
+    const std::vector<double>& xi,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    uint32_t override_node,
+    double override_xi)
+{
+    if (!sample.hit)
+        return 0.0;
+
+    const auto xiAt = [&](uint32_t v) -> double
+    {
+        if (v == override_node)
+            return override_xi;
+        return (v < xi.size()) ? xi[v] : 0.0;
+    };
+
+    const size_t numV = sample.parent.size();
+    std::vector<uint8_t> reachable(numV, 0);
+
+    for (uint32_t u : sample.bfs_order)
+    {
+        if (u == sample.root)
+        {
+            reachable[u] = 1;
+        }
+        else
+        {
+            const uint32_t p = sample.parent[u];
+            if (p == UINT32_MAX || !reachable[p])
+                continue;
+            if (sample.xi_gate[u] < 0.0f)
+                continue;
+            if (u != sample.root && static_cast<double>(sample.xi_gate[u]) > xiAt(u))
+                continue;
+            reachable[u] = 1;
+        }
+
+        if (reachable[u] && u == sample.hit_node)
+        {
+            double log_w = 0.0;
+            uint32_t cur = sample.hit_node;
+            while (cur != sample.root)
+            {
+                if (cur != sample.hit_node && cur != sample.root)
+                {
+                    const double xv = xiAt(cur);
+                    if (xv <= 0.0)
+                        return 0.0;
+                    log_w += std::log(xv);
+                }
+                const uint32_t p = sample.parent[cur];
+                if (p == UINT32_MAX)
+                    return 0.0;
+                cur = p;
+            }
+
+            if (sample.root >= tau.size() || sample.root >= lam.size())
+                return 0.0;
+
+            const double root_coef = 1.0 - lam[sample.root] * xiAt(sample.root);
+            return root_coef * std::exp(log_w);
+        }
+    }
+
+    return 0.0;
+}
+
+double Alg::frimEstimateJFromRRStructures(
+    const std::vector<FrimRRStructureSample>& samples,
+    const std::vector<double>& xi,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam) const
+{
+    if (samples.empty())
+        return 0.0;
+
+    const double tau_sum = frimTauSum(tau);
+    if (tau_sum <= 0.0)
+        return 0.0;
+
+    double total = 0.0;
+    for (const auto& sample : samples)
+        total += frimRRStructureSampleWeight(sample, xi, tau, lam);
+
+    return (tau_sum / static_cast<double>(samples.size())) * total;
+}
+
+FrimXiResult Alg::frimMethodRRCrn(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_rr,
+    int max_sweeps,
+    double delta_tol)
+{
+    FrimXiResult result;
+    result.xi = xi_init;
+
+    if (_numV == 0 || num_rr == 0 || q.size() != _numV
+        || tau.size() != _numV || lam.size() != _numV)
+        return result;
+
+    const double tau_sum = frimTauSum(tau);
+    if (tau_sum <= 0.0)
+        return result;
+
+    Timer timer;
+    const std::vector<FrimRRStructureSample> samples =
+        frimBuildRRStructureSamples(num_rr, tau, q);
+    result.run_info.time_sample_sec = timer.get_operation_time();
+
+    std::vector<std::vector<size_t>> node_samples(_numV);
+    for (size_t r = 0; r < samples.size(); r++)
+    {
+        for (uint32_t u : samples[r].bfs_order)
+            node_samples[u].push_back(r);
+    }
+
+    std::vector<double> sample_weights(num_rr, 0.0);
+    double weight_sum = 0.0;
+    for (size_t r = 0; r < samples.size(); r++)
+    {
+        sample_weights[r] =
+            frimRRStructureSampleWeight(samples[r], result.xi, tau, lam);
+        weight_sum += sample_weights[r];
+    }
+
+    const double scale = tau_sum / static_cast<double>(num_rr);
+    result.J_hat = scale * weight_sum;
+    std::cout << "[FRIM-RR-CRN] initial J_hat=" << result.J_hat
+              << " (tau-root, xi_gate CRN, R=" << num_rr << ")"
+              << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+    auto recomputeAffected = [&](uint32_t u, double xi_u, double& affected_sum)
+    {
+        affected_sum = 0.0;
+        for (size_t r : node_samples[u])
+        {
+            affected_sum += frimRRStructureSampleWeight(
+                samples[r], result.xi, tau, lam, u, xi_u);
+        }
+    };
+
+    int sweeps_completed = 0;
+    for (int sweep = 0; sweep < max_sweeps; sweep++)
+    {
+        sweeps_completed++;
+        bool improved = false;
+        std::vector<uint32_t> order(_numV);
+        std::iota(order.begin(), order.end(), 0U);
+        for (size_t i = _numV - 1; i > 0; i--)
+        {
+            const size_t j = dsfmt_gv_genrand_uint32_range(static_cast<uint32_t>(i + 1));
+            std::swap(order[i], order[j]);
+        }
+
+        std::cout << "[FRIM-RR-CRN] sweep " << (sweep + 1) << "/" << max_sweeps
+                  << " start, J_hat=" << result.J_hat
+                  << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+        uint32_t currProgress = 0;
+        size_t node_idx = 0;
+        size_t updates_this_sweep = 0;
+        for (uint32_t u : order)
+        {
+            node_idx++;
+            if (node_idx * 100 >= _numV * currProgress)
+            {
+                std::cout << "[FRIM-RR-CRN] sweep " << (sweep + 1) << "/" << max_sweeps
+                          << " nodes " << currProgress << "%, updates=" << updates_this_sweep
+                          << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+                currProgress += 20;
+            }
+
+            double affected_old = 0.0;
+            for (size_t r : node_samples[u])
+                affected_old += sample_weights[r];
+
+            double affected_lo = 0.0;
+            double affected_one = 0.0;
+            recomputeAffected(u, xi_lo, affected_lo);
+            recomputeAffected(u, 1.0, affected_one);
+
+            const double J_lo = scale * (weight_sum - affected_old + affected_lo);
+            const double J_one = scale * (weight_sum - affected_old + affected_one);
+
+            const double xi_pick =
+                (J_one > J_lo + delta_tol) ? 1.0
+                : (J_lo > J_one + delta_tol) ? xi_lo
+                : (J_one >= J_lo ? 1.0 : xi_lo);
+
+            if (std::abs(result.xi[u] - xi_pick) > 0.0)
+            {
+                result.xi[u] = xi_pick;
+                const double affected_new =
+                    (std::abs(xi_pick - 1.0) <= 0.0) ? affected_one : affected_lo;
+                weight_sum = weight_sum - affected_old + affected_new;
+                for (size_t r : node_samples[u])
+                {
+                    sample_weights[r] = frimRRStructureSampleWeight(
+                        samples[r], result.xi, tau, lam);
+                }
+                result.J_hat = scale * weight_sum;
+                improved = true;
+                updates_this_sweep++;
+            }
+        }
+
+        std::cout << "[FRIM-RR-CRN] sweep " << (sweep + 1) << "/" << max_sweeps
+                  << " done: updates=" << updates_this_sweep
+                  << ", improved=" << (improved ? "yes" : "no")
+                  << ", J_hat=" << result.J_hat
+                  << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+        if (!improved)
+            break;
+    }
+
+    result.run_info.time_solve_sec = timer.get_operation_time();
+    result.run_info.sweeps_completed = sweeps_completed;
+    result.run_info.max_sweeps = max_sweeps;
+    result.J_method_rr_crn = scale * weight_sum;
+    result.J_hat = result.J_method_rr_crn;
+    result.run_info.time_total_sec = timer.get_total_time();
+    return result;
+}
+
+FrimXiResult Alg::frim_solve_rr_crn(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_rr,
+    int max_sweeps,
+    double delta_tol)
+{
+    FrimXiResult result;
+    if (_numV == 0 || tau.size() != _numV || lam.size() != _numV || q.size() != _numV)
+        return result;
+
+    std::vector<double> init = xi_init;
+    if (init.size() != _numV)
+        init.assign(_numV, 1.0);
+
+    std::cout << "[FRIM-RR-CRN] " << num_rr
+              << " tau-root structural RR samples, CRN {xi_lo,1} per-node..."
+              << std::endl;
+    const FrimXiResult method_crn = frimMethodRRCrn(
+        tau, lam, q, init, xi_lo, num_rr, max_sweeps, delta_tol);
+    result = method_crn;
+    result.J_hat = result.J_method_rr_crn;
+    std::cout << "[FRIM-RR-CRN] done: J_hat=" << result.J_method_rr_crn << std::endl;
+
+    frimFillXiStats(result, xi_lo);
+    std::cout << "[FRIM-RR-CRN] xi: " << result.run_info.num_xi_one << " nodes at 1, "
+              << result.run_info.num_xi_lo << " nodes at " << xi_lo << std::endl;
+    return result;
+}
+
+double Alg::frim_estimate_j_at_xi(
+    const std::vector<double>& xi,
+    const std::vector<double>& q,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    size_t num_rr)
+{
+    return frimEstimateJ(xi, q, tau, lam, num_rr);
+}
+
+double Alg::frim_estimate_mc_gate_at_xi(
+    const Graph& forwardGraph,
+    const std::vector<double>& xi,
+    const std::vector<double>& q,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    size_t num_mc) const
+{
+    if (num_mc == 0)
+        return 0.0;
+
+    double sum = 0.0;
+    for (size_t r = 0; r < num_mc; r++)
+    {
+        FrimLiveEdgeSample sample = frimSampleLiveEdge(forwardGraph);
+        frimComputeActive(sample, q, xi, sample.active);
+        sum += frimObjectiveOnSample(sample, tau, lam, xi);
+    }
+    return sum / static_cast<double>(num_mc);
+}
+
+FrimXiResult Alg::frim_solve_rr_naive(
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_rr,
+    int max_sweeps,
+    double delta_tol)
+{
+    FrimXiResult result;
+    if (_numV == 0 || tau.size() != _numV || lam.size() != _numV || q.size() != _numV)
+        return result;
+
+    std::vector<double> init = xi_init;
+    if (init.size() != _numV)
+        init.assign(_numV, 1.0);
+
+    std::cout << "[FRIM-RR-naive] " << num_rr
+              << " tau*(1-lam*xi)-root RR samples, per-node {xi_lo,1} J estimate, resample per call..."
+              << std::endl;
+    const FrimXiResult method_naive = frimMethodRRNaive(
+        tau, lam, q, init, xi_lo, num_rr, max_sweeps, delta_tol);
+    result = method_naive;
+    result.J_hat = result.J_method_rr_naive;
+    std::cout << "[FRIM-RR-naive] done: J_hat=" << result.J_method_rr_naive << std::endl;
+
+    frimFillXiStats(result, xi_lo);
+    std::cout << "[FRIM-RR-naive] xi: " << result.run_info.num_xi_one << " nodes at 1, "
+              << result.run_info.num_xi_lo << " nodes at " << xi_lo << std::endl;
+    return result;
+}
+
+FrimLiveEdgeSample Alg::frimSampleLiveEdge(
+    const Graph& forwardGraph) const
+{
+    FrimLiveEdgeSample sample;
+    sample.kept_out.assign(forwardGraph.size(), {});
+    sample.gates.assign(_numV, 0.0);
+    sample.seed_gates.assign(_numV, 0.0);
+    for (size_t u = 0; u < forwardGraph.size(); u++)
+    {
+        for (const auto& edge : forwardGraph[u])
+        {
+            if (dsfmt_gv_genrand_open_close() <= edge.second)
+                sample.kept_out[u].push_back(edge.first);
+        }
+    }
+    for (size_t i = 0; i < _numV; i++)
+    {
+        sample.gates[i] = dsfmt_gv_genrand_close_open();
+        sample.seed_gates[i] = dsfmt_gv_genrand_open_close();
+    }
+    return sample;
+}
+
+double Alg::frimObjectiveWithXi(
+    const FrimLiveEdgeSample& sample,
+    const std::vector<double>& q,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& xi) const
+{
+    std::vector<uint8_t> active;
+    frimComputeActive(sample, q, xi, active);
+
+    double sum = 0.0;
+    for (size_t v = 0; v < _numV; v++)
+    {
+        if (active[v])
+            sum += nodeObjectiveValue(tau, lam, xi, static_cast<uint32_t>(v));
+    }
+    return sum;
+}
+
+FrimXiResult Alg::frimMethodMCNaive(
+    const Graph& forwardGraph,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_mc,
+    int max_sweeps,
+    double delta_tol) const
+{
+    FrimXiResult result;
+    result.xi = xi_init;
+
+    if (_numV == 0 || num_mc == 0 || q.size() != _numV)
+        return result;
+
+    Timer timer;
+    uint32_t currProgress = 0;
+
+    std::vector<FrimLiveEdgeSample> live_samples;
+    live_samples.reserve(num_mc);
+    for (size_t r = 0; r < num_mc; r++)
+    {
+        if (r * 100 >= num_mc * currProgress)
+        {
+            std::cout << "[FRIM-MC-naive] sampling live-edge: " << currProgress << "%, "
+                      << "elapsed=" << timer.get_total_time() << "s" << std::endl;
+            currProgress += 20;
+        }
+        live_samples.push_back(frimSampleLiveEdge(forwardGraph));
+    }
+    std::cout << "[FRIM-MC-naive] sampled " << num_mc << " live-edge graphs, "
+              << "elapsed=" << timer.get_total_time() << "s" << std::endl;
+    result.run_info.time_sample_sec = timer.get_operation_time();
+
+    int sweeps_completed = 0;
+    for (int sweep = 0; sweep < max_sweeps; sweep++)
+    {
+        sweeps_completed++;
+        bool improved = false;
+        size_t flips_this_sweep = 0;
+        std::vector<uint32_t> order(_numV);
+        std::iota(order.begin(), order.end(), 0U);
+        for (size_t i = _numV - 1; i > 0; i--)
+        {
+            const size_t j = dsfmt_gv_genrand_uint32_range(static_cast<uint32_t>(i + 1));
+            std::swap(order[i], order[j]);
+        }
+
+        std::cout << "[FRIM-MC-naive] sweep " << (sweep + 1) << "/" << max_sweeps
+                  << " start, elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+        currProgress = 0;
+        size_t node_idx = 0;
+        for (uint32_t u : order)
+        {
+            node_idx++;
+            if (node_idx * 100 >= _numV * currProgress)
+            {
+                std::cout << "[FRIM-MC-naive] sweep " << (sweep + 1) << "/" << max_sweeps
+                          << " nodes " << currProgress << "%, flips=" << flips_this_sweep
+                          << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+                currProgress += 20;
+            }
+
+            const double xi_new = (result.xi[u] > 0.5) ? xi_lo : 1.0;
+            if (std::abs(result.xi[u] - xi_new) <= 0.0)
+                continue;
+
+            std::vector<double> xi_flip = result.xi;
+            xi_flip[u] = xi_new;
+
+            double sum_orig = 0.0;
+            double sum_flip = 0.0;
+            for (const auto& sample : live_samples)
+            {
+                sum_orig += frimObjectiveWithXi(sample, q, tau, lam, result.xi);
+                sum_flip += frimObjectiveWithXi(sample, q, tau, lam, xi_flip);
+            }
+            const double delta = (sum_flip - sum_orig) / static_cast<double>(num_mc);
+
+            if (delta > delta_tol)
+            {
+                result.xi[u] = xi_new;
+                improved = true;
+                flips_this_sweep++;
+            }
+        }
+
+        std::cout << "[FRIM-MC-naive] sweep " << (sweep + 1) << "/" << max_sweeps
+                  << " done: flips=" << flips_this_sweep
+                  << ", improved=" << (improved ? "yes" : "no")
+                  << ", elapsed=" << timer.get_total_time() << "s" << std::endl;
+
+        if (!improved)
+            break;
+    }
+    result.run_info.time_solve_sec = timer.get_operation_time();
+    result.run_info.sweeps_completed = sweeps_completed;
+    result.run_info.max_sweeps = max_sweeps;
+
+    std::cout << "[FRIM-MC-naive] evaluating J_hat..." << std::endl;
+    double J_hat = 0.0;
+    for (const auto& sample : live_samples)
+        J_hat += frimObjectiveWithXi(sample, q, tau, lam, result.xi);
+    result.J_method_mc_naive = J_hat / static_cast<double>(num_mc);
+    result.J_hat = result.J_method_mc_naive;
+    result.run_info.time_estimate_sec = timer.get_operation_time();
+    result.run_info.time_total_sec = timer.get_total_time();
+    std::cout << "[FRIM-MC-naive] J_hat evaluated, elapsed=" << result.run_info.time_total_sec << "s"
+              << std::endl;
+    return result;
+}
+
+FrimXiResult Alg::frim_solve_mc(
+    const Graph& forwardGraph,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_mc,
+    int max_sweeps,
+    double delta_tol)
+{
+    FrimXiResult result;
+    if (_numV == 0 || tau.size() != _numV || lam.size() != _numV || q.size() != _numV)
+        return result;
+
+    std::vector<double> init = xi_init;
+    if (init.size() != _numV)
+        init.assign(_numV, 1.0);
+
+    std::cout << "[FRIM-MC] coordinate ascent with " << num_mc << " CRN samples (random seed)..." << std::endl;
+    const FrimXiResult method_mc = frimMethodMC(
+        forwardGraph, tau, lam, q, init, xi_lo, num_mc, max_sweeps, delta_tol);
+    result = method_mc;
+    result.J_hat = result.J_method_mc;
+    std::cout << "[FRIM-MC] done: J_hat=" << result.J_method_mc << std::endl;
+
+    frimFillXiStats(result, xi_lo);
+    std::cout << "[FRIM-MC] xi: " << result.run_info.num_xi_one << " nodes at 1, "
+              << result.run_info.num_xi_lo << " nodes at " << xi_lo << std::endl;
+    return result;
+}
+
+FrimXiResult Alg::frim_solve_mc_naive(
+    const Graph& forwardGraph,
+    const std::vector<double>& tau,
+    const std::vector<double>& lam,
+    const std::vector<double>& q,
+    const std::vector<double>& xi_init,
+    double xi_lo,
+    size_t num_mc,
+    int max_sweeps,
+    double delta_tol)
+{
+    FrimXiResult result;
+    if (_numV == 0 || tau.size() != _numV || lam.size() != _numV || q.size() != _numV)
+        return result;
+
+    std::vector<double> init = xi_init;
+    if (init.size() != _numV)
+        init.assign(_numV, 1.0);
+
+    std::cout << "[FRIM-MC-naive] " << num_mc
+              << " CRN live-edge samples (full BFS delta, real-time xi)..." << std::endl;
+    const FrimXiResult method_naive = frimMethodMCNaive(
+        forwardGraph, tau, lam, q, init, xi_lo, num_mc, max_sweeps, delta_tol);
+    result = method_naive;
+    result.J_hat = result.J_method_mc_naive;
+    std::cout << "[FRIM-MC-naive] done: J_hat=" << result.J_method_mc_naive << std::endl;
+
+    frimFillXiStats(result, xi_lo);
+    std::cout << "[FRIM-MC-naive] xi: " << result.run_info.num_xi_one << " nodes at 1, "
+              << result.run_info.num_xi_lo << " nodes at " << xi_lo << std::endl;
+    return result;
+}
+
+// ===== end FRIM xi selection =====
