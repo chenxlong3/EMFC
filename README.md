@@ -2,15 +2,13 @@
 
 **Engagement Maximization via Forwarding Control**
 
-This project implements algorithms for engagement maximization via forwarding control. The RR-set sampling component builds on SUBSIM / HIST from:
+This project implements algorithms for engagement maximization via forwarding control. The RR-set sampling component builds on SUBSIM from:
 
 - Qintian Guo, Sibo Wang, Zhewei Wei, and Ming Chen. 2020. Influence Maximization Revisited: Efficient Reverse Reachable Set Generation with Bound Tightened. In *SIGMOD*.
 
 Please cite the paper if you would like to use the SUBSIM / HIST code.
 
 The code is developed on the basis of the project: https://github.com/tangj90/OPIM.
-
-Author: Qintian Guo (qtguo@se.cuhk.edu.hk)
 
 ## Compile
 
