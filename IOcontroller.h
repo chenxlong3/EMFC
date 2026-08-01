@@ -113,14 +113,34 @@ public:
         return probDist;
     }
 
+    static std::string BuildNodeHyperParamsFilename(
+        const std::string& graphName,
+        const std::string& suffix = "")
+    {
+        if (suffix.empty())
+            return graphName + ".nodehyper.vec";
+        return graphName + ".nodehyper." + suffix + ".vec";
+    }
+
     static void SaveGraphNodeHyperParams(
         const std::string& graphName,
         const std::vector<double>& q,
         const std::vector<double>& tau,
         const std::vector<double>& lam)
     {
+        SaveGraphNodeHyperParamsWithSuffix(graphName, "", q, tau, lam);
+    }
+
+    static void SaveGraphNodeHyperParamsWithSuffix(
+        const std::string& graphName,
+        const std::string& suffix,
+        const std::vector<double>& q,
+        const std::vector<double>& tau,
+        const std::vector<double>& lam)
+    {
+        const std::string filename = BuildNodeHyperParamsFilename(graphName, suffix);
         const std::tuple<std::vector<double>, std::vector<double>, std::vector<double>> blob(q, tau, lam);
-        SaveFile(graphName + ".nodehyper.vec", blob);
+        SaveFile(filename, blob);
     }
 
     static bool readGraphNodeHyperParamsFile(
@@ -129,7 +149,17 @@ public:
         std::vector<double>& tau,
         std::vector<double>& lam)
     {
-        const std::string filename = graphName + ".nodehyper.vec";
+        return readGraphNodeHyperParamsFileWithSuffix(graphName, "", q, tau, lam);
+    }
+
+    static bool readGraphNodeHyperParamsFileWithSuffix(
+        const std::string& graphName,
+        const std::string& suffix,
+        std::vector<double>& q,
+        std::vector<double>& tau,
+        std::vector<double>& lam)
+    {
+        const std::string filename = BuildNodeHyperParamsFilename(graphName, suffix);
         std::ifstream infile(filename, std::ios::binary);
         if (infile.eof() || infile.fail())
         {
@@ -166,21 +196,26 @@ public:
     }
 
     /// Load q/tau/lam into global-style storage; returns false if file is missing.
-    static bool LoadGraphNodeHyperParamsData(const std::string& graphName, NodeHyperParamsData& out)
+    static bool LoadGraphNodeHyperParamsData(
+        const std::string& graphName,
+        NodeHyperParamsData& out,
+        const std::string& suffix = "")
     {
         out.q.clear();
         out.tau.clear();
         out.lam.clear();
         out.loaded = false;
 
-        if (!readGraphNodeHyperParamsFile(graphName, out.q, out.tau, out.lam))
+        if (!readGraphNodeHyperParamsFileWithSuffix(graphName, suffix, out.q, out.tau, out.lam))
         {
             return false;
         }
 
         out.loaded = true;
-        std::cout << "Loaded node hyper params: q/tau/lam size = "
-                  << out.q.size() << std::endl;
+        std::cout << "Loaded node hyper params";
+        if (!suffix.empty())
+            std::cout << " (suffix=" << suffix << ")";
+        std::cout << ": q/tau/lam size = " << out.q.size() << std::endl;
         return true;
     }
 

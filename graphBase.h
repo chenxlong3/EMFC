@@ -24,14 +24,14 @@ bool greater_first(const std::pair<uint32_t, float> x, const std::pair<uint32_t,
 class GraphBase
 {
 public:
-    enum class LamAssignMode { UNIFORM, UNIRAND, TWO_TIER };
-    enum class QAssignMode { ACTIVE_INACTIVE_NORMAL };
-    enum class TauAssignMode { UNIFORM_0_1, EXPONENTIAL_NORM };
+    enum class LamAssignMode { UNIFORM, UNIRAND, TWO_TIER, EXPONENTIAL };
+    enum class QAssignMode { ACTIVE_INACTIVE_NORMAL, EXPONENTIAL, UNIRAND };
+    enum class TauAssignMode { UNIFORM_0_1, EXPONENTIAL_NORM, EXPONENTIAL_RANDOM, Q_PLUS_NORMAL };
 
     /// Configurable assignment modes for per-node hyperparameters (q, tau, lam).
     struct NodeHyperParamsConfig
     {
-        LamAssignMode lam_mode = LamAssignMode::TWO_TIER;
+        LamAssignMode lam_mode = LamAssignMode::UNIRAND;
         double lam_uniform_value = 0.3;
         double lam_high_ratio = 0.3;
         double lam_high_lo = 0.6;
@@ -39,20 +39,30 @@ public:
         double lam_low_lo = 0.1;
         double lam_low_hi = 0.3;
 
-        QAssignMode q_mode = QAssignMode::ACTIVE_INACTIVE_NORMAL;
+        QAssignMode q_mode = QAssignMode::EXPONENTIAL;
+        double q_exponential_scale = 1.0;
+        double q_unirand_lo = 0.0;
+        double q_unirand_hi = 1.0;
         double active_user_ratio = 0.2;
         double active_q_mean = 0.8;
         double active_q_var = 1.0;
         double inactive_q_mean = 0.2;
         double inactive_q_var = 1.0;
 
-        TauAssignMode tau_mode = TauAssignMode::EXPONENTIAL_NORM;
+        TauAssignMode tau_mode = TauAssignMode::Q_PLUS_NORMAL;
         double tau_exponential_scale = 1.0;
         double tau_lo = 1.0;
         double tau_hi = 5.0;
+        /// Add Uniform(-tau_jitter, +tau_jitter) noise to q before rank-matching tau.
+        /// 0 = strict rank; typical soft value ~0.15–0.25 when q in [0,1].
+        double tau_jitter = 0.0;
+
+        /// Noise variance for tau_mode=q_normal: tau = clamp((q + N(0, tau_q_var)) * tau_hi, ...).
+        double tau_q_var = 1.0;
 
         double lam_unirand_lo = 0.1;
         double lam_unirand_hi = 0.5;
+        double lam_exponential_scale = 1.0;
     };
 
     static const NodeHyperParamsConfig& defaultNodeHyperParamsConfig()
@@ -70,7 +80,16 @@ public:
         double active_q_mean,
         double active_q_var,
         double inactive_q_mean,
-        double inactive_q_var)
+        double inactive_q_var,
+        const std::string& q_mode_str = "exponential",
+        double q_exp_scale = 1.0,
+        double q_unirand_lo = 0.0,
+        double q_unirand_hi = 1.0,
+        const std::string& tau_mode_str = "q_normal",
+        double tau_lo = 1.0,
+        double tau_hi = 5.0,
+        double tau_jitter = -1.0,
+        double tau_q_var = 1.0)
     {
         NodeHyperParamsConfig config;
         config.lam_mode = LamAssignMode::UNIRAND;
@@ -78,6 +97,8 @@ public:
             config.lam_mode = LamAssignMode::UNIFORM;
         else if (lam_mode_str == "two_tier")
             config.lam_mode = LamAssignMode::TWO_TIER;
+        else if (lam_mode_str == "exponential" || lam_mode_str == "exp")
+            config.lam_mode = LamAssignMode::EXPONENTIAL;
         config.lam_uniform_value = lam_uniform_value;
         config.lam_unirand_lo = lam_unirand_lo;
         config.lam_unirand_hi = lam_unirand_hi;
@@ -86,6 +107,45 @@ public:
         config.active_q_var = active_q_var;
         config.inactive_q_mean = inactive_q_mean;
         config.inactive_q_var = inactive_q_var;
+
+        config.q_exponential_scale = q_exp_scale;
+        config.q_unirand_lo = q_unirand_lo;
+        config.q_unirand_hi = q_unirand_hi;
+        if (q_mode_str == "exponential" || q_mode_str == "exp")
+            config.q_mode = QAssignMode::EXPONENTIAL;
+        else if (q_mode_str == "unirand" || q_mode_str == "uniform")
+            config.q_mode = QAssignMode::UNIRAND;
+        else
+            config.q_mode = QAssignMode::ACTIVE_INACTIVE_NORMAL;
+
+        config.tau_lo = tau_lo;
+        config.tau_hi = tau_hi;
+        config.tau_q_var = (tau_q_var > 0.0) ? tau_q_var : 1.0;
+        if (tau_mode_str == "uniform")
+        {
+            config.tau_mode = TauAssignMode::UNIFORM_0_1;
+            config.tau_jitter = 0.0;
+        }
+        else if (tau_mode_str == "exp_random" || tau_mode_str == "exponential_random")
+        {
+            config.tau_mode = TauAssignMode::EXPONENTIAL_RANDOM;
+            config.tau_jitter = 0.0;
+        }
+        else if (tau_mode_str == "soft" || tau_mode_str == "exponential_soft")
+        {
+            config.tau_mode = TauAssignMode::EXPONENTIAL_NORM;
+            config.tau_jitter = (tau_jitter >= 0.0) ? tau_jitter : 0.2;
+        }
+        else if (tau_mode_str == "q_normal" || tau_mode_str == "q_plus_normal")
+        {
+            config.tau_mode = TauAssignMode::Q_PLUS_NORMAL;
+            config.tau_jitter = 0.0;
+        }
+        else
+        {
+            config.tau_mode = TauAssignMode::EXPONENTIAL_NORM;
+            config.tau_jitter = (tau_jitter >= 0.0) ? tau_jitter : 0.0;
+        }
         return config;
     }
 
@@ -95,6 +155,208 @@ public:
         std::vector<double> tau;
         std::vector<double> lam;
     };
+
+    /// Load baseline nodehyper.vec, override selected fields, save to a suffix file.
+    struct HypDeriveSpec
+    {
+        std::string base_suffix;
+        std::string output_suffix;
+        bool keep_tau = true;
+        bool keep_lam = true;
+        bool override_q = false;
+        bool override_lam = false;
+        bool override_tau = false;
+        int rand_seed = -1;
+        NodeHyperParamsConfig q_config;
+        NodeHyperParamsConfig lam_config;
+        NodeHyperParamsConfig tau_config;
+    };
+
+    static std::string trimHypProfileValue(const std::string& s)
+    {
+        const size_t start = s.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos)
+            return "";
+        const size_t end = s.find_last_not_of(" \t\r\n");
+        return s.substr(start, end - start + 1);
+    }
+
+    static bool parseHypProfileBool(const std::string& value, bool default_value)
+    {
+        const std::string v = trimHypProfileValue(value);
+        if (v.empty())
+            return default_value;
+        if (v == "1" || v == "true" || v == "yes" || v == "on")
+            return true;
+        if (v == "0" || v == "false" || v == "no" || v == "off")
+            return false;
+        return default_value;
+    }
+
+    static bool loadHypDeriveProfile(const std::string& profile_path, HypDeriveSpec& spec)
+    {
+        std::ifstream infile(profile_path);
+        if (!infile.is_open())
+        {
+            std::cout << "Cannot open hyp profile: " << profile_path << std::endl;
+            return false;
+        }
+
+        std::string q_mode = "keep";
+        std::string lam_mode = "keep";
+        std::string tau_mode = "keep";
+        double q_lo = 0.0;
+        double q_hi = 1.0;
+        double q_exp_scale = 1.0;
+        double lam_lo = 0.1;
+        double lam_hi = 0.5;
+        double lam_value = 0.3;
+        double lam_exp_scale = 1.0;
+        double tau_lo = 1.0;
+        double tau_hi = 5.0;
+        double tau_jitter = -1.0;
+        double tau_q_var = 1.0;
+
+        std::string line;
+        while (std::getline(infile, line))
+        {
+            line = trimHypProfileValue(line);
+            if (line.empty() || line[0] == '#')
+                continue;
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos)
+                continue;
+            const std::string key = trimHypProfileValue(line.substr(0, eq));
+            const std::string value = trimHypProfileValue(line.substr(eq + 1));
+            if (key == "base_suffix")
+                spec.base_suffix = value;
+            else if (key == "output_suffix")
+                spec.output_suffix = value;
+            else if (key == "keep_tau")
+                spec.keep_tau = parseHypProfileBool(value, spec.keep_tau);
+            else if (key == "keep_lam")
+                spec.keep_lam = parseHypProfileBool(value, spec.keep_lam);
+            else if (key == "rand_seed")
+                spec.rand_seed = std::stoi(value);
+            else if (key == "q_mode")
+                q_mode = value;
+            else if (key == "q_lo")
+                q_lo = std::stod(value);
+            else if (key == "q_hi")
+                q_hi = std::stod(value);
+            else if (key == "q_exp_scale")
+                q_exp_scale = std::stod(value);
+            else if (key == "lam_mode")
+                lam_mode = value;
+            else if (key == "lam_lo")
+                lam_lo = std::stod(value);
+            else if (key == "lam_hi")
+                lam_hi = std::stod(value);
+            else if (key == "lam_value")
+                lam_value = std::stod(value);
+            else if (key == "lam_exp_scale")
+                lam_exp_scale = std::stod(value);
+            else if (key == "tau_mode")
+                tau_mode = value;
+            else if (key == "tau_lo")
+                tau_lo = std::stod(value);
+            else if (key == "tau_hi")
+                tau_hi = std::stod(value);
+            else if (key == "tau_jitter")
+                tau_jitter = std::stod(value);
+            else if (key == "tau_q_var")
+                tau_q_var = std::stod(value);
+        }
+
+        if (spec.output_suffix.empty())
+        {
+            std::cout << "hyp profile missing output_suffix: " << profile_path << std::endl;
+            return false;
+        }
+
+        if (q_mode != "keep")
+        {
+            spec.override_q = true;
+            spec.q_config = makeNodeHyperParamsConfig(
+                "unirand", lam_value, lam_lo, lam_hi,
+                0.2, 0.8, 1.0, 0.2, 1.0,
+                q_mode, q_exp_scale, q_lo, q_hi,
+                "q_normal", tau_lo, tau_hi, tau_jitter, tau_q_var);
+        }
+        if (!spec.keep_lam && lam_mode != "keep")
+        {
+            spec.override_lam = true;
+            spec.lam_config = makeNodeHyperParamsConfig(
+                lam_mode, lam_value, lam_lo, lam_hi,
+                0.2, 0.8, 1.0, 0.2, 1.0,
+                "exponential", q_exp_scale, q_lo, q_hi,
+                "q_normal", tau_lo, tau_hi, tau_jitter, tau_q_var);
+            spec.lam_config.lam_exponential_scale = lam_exp_scale;
+        }
+        if (!spec.keep_tau && tau_mode != "keep")
+        {
+            spec.override_tau = true;
+            spec.tau_config = makeNodeHyperParamsConfig(
+                "unirand", lam_value, lam_lo, lam_hi,
+                0.2, 0.8, 1.0, 0.2, 1.0,
+                "exponential", q_exp_scale, q_lo, q_hi,
+                tau_mode, tau_lo, tau_hi, tau_jitter, tau_q_var);
+        }
+        return true;
+    }
+
+    static bool deriveAndSaveNodeHyperParams(
+        const std::string& graphName,
+        const HypDeriveSpec& spec)
+    {
+        NodeHyperParams params;
+        if (!TIO::readGraphNodeHyperParamsFileWithSuffix(
+                graphName, spec.base_suffix, params.q, params.tau, params.lam))
+        {
+            std::cout << "Cannot load base node hyper params for " << graphName;
+            if (!spec.base_suffix.empty())
+                std::cout << " (suffix=" << spec.base_suffix << ")";
+            std::cout << std::endl;
+            return false;
+        }
+
+        NodeHyperParams scratch = params;
+        if (spec.override_q)
+        {
+            assignQ(spec.q_config, scratch);
+            params.q = scratch.q;
+        }
+        if (spec.override_lam)
+        {
+            assignLam(spec.lam_config, scratch);
+            params.lam = scratch.lam;
+        }
+        if (spec.override_tau)
+        {
+            assignTau(spec.tau_config, scratch);
+            params.tau = scratch.tau;
+        }
+
+        TIO::SaveGraphNodeHyperParamsWithSuffix(
+            graphName, spec.output_suffix, params.q, params.tau, params.lam);
+
+        double q_sum = 0.0;
+        double tau_sum = 0.0;
+        double lam_sum = 0.0;
+        for (size_t i = 0; i < params.q.size(); i++)
+        {
+            q_sum += params.q[i];
+            tau_sum += params.tau[i];
+            lam_sum += params.lam[i];
+        }
+        std::cout << "Derived node hyper params -> "
+                  << graphName << ".nodehyper." << spec.output_suffix << ".vec"
+                  << " (n=" << params.q.size()
+                  << ", sum q=" << q_sum
+                  << ", sum tau=" << tau_sum
+                  << ", sum lam=" << lam_sum << ")" << std::endl;
+        return true;
+    }
 
     /// Directed graph: graph[u] = out-edges from u. avg_deg = |E|/|V|; four Pearson r on each directed edge u->v.
     struct DegreeAssortativityStats
@@ -282,7 +544,28 @@ public:
                     params.lam[i] = config.lam_low_lo + u * (config.lam_low_hi - config.lam_low_lo);
             }
             break;
+        case LamAssignMode::EXPONENTIAL:
+        {
+            // Truncated exponential on [0,1]: f(lam) propto exp(-lam / scale).
+            const double scale = (config.lam_exponential_scale > 0.0)
+                ? config.lam_exponential_scale
+                : 1.0;
+            const double trunc_mass = 1.0 - std::exp(-1.0 / scale);
+            for (size_t i = 0; i < n; i++)
+            {
+                const double u = dsfmt_gv_genrand_open_open();
+                params.lam[i] = -scale * std::log(1.0 - u * trunc_mass);
+            }
+            break;
         }
+        }
+    }
+
+    static double clampRange(double x, double lo, double hi)
+    {
+        if (x < lo) return lo;
+        if (x > hi) return hi;
+        return x;
     }
 
     static void assignTau(const NodeHyperParamsConfig& config, NodeHyperParams& params)
@@ -291,6 +574,16 @@ public:
         const double tau_span = config.tau_hi - config.tau_lo;
         switch (config.tau_mode)
         {
+        case TauAssignMode::Q_PLUS_NORMAL:
+            for (size_t i = 0; i < n; i++)
+            {
+                const double z = sampleNormal(0.0, config.tau_q_var);
+                params.tau[i] = clampRange(
+                    (params.q[i] + z) * config.tau_hi,
+                    config.tau_lo,
+                    config.tau_hi);
+            }
+            break;
         case TauAssignMode::UNIFORM_0_1:
             for (size_t i = 0; i < n; i++)
             {
@@ -299,6 +592,7 @@ public:
             }
             break;
         case TauAssignMode::EXPONENTIAL_NORM:
+        case TauAssignMode::EXPONENTIAL_RANDOM:
         {
             std::vector<double> tau_samples(n);
             double max_tau = 0.0;
@@ -324,10 +618,36 @@ public:
 
             std::vector<uint32_t> order(n);
             std::iota(order.begin(), order.end(), 0U);
-            std::sort(
-                order.begin(),
-                order.end(),
-                [&](uint32_t a, uint32_t b) { return params.q[a] > params.q[b]; });
+            if (config.tau_mode == TauAssignMode::EXPONENTIAL_RANDOM)
+            {
+                for (size_t i = n - 1; i > 0; i--)
+                {
+                    const size_t j =
+                        dsfmt_gv_genrand_uint32_range(static_cast<uint32_t>(i + 1));
+                    std::swap(order[i], order[j]);
+                }
+            }
+            else if (config.tau_jitter > 0.0)
+            {
+                std::vector<double> keys(n);
+                for (size_t i = 0; i < n; i++)
+                {
+                    keys[i] = params.q[i]
+                        + config.tau_jitter
+                              * (2.0 * dsfmt_gv_genrand_close_open() - 1.0);
+                }
+                std::sort(
+                    order.begin(),
+                    order.end(),
+                    [&](uint32_t a, uint32_t b) { return keys[a] > keys[b]; });
+            }
+            else
+            {
+                std::sort(
+                    order.begin(),
+                    order.end(),
+                    [&](uint32_t a, uint32_t b) { return params.q[a] > params.q[b]; });
+            }
 
             for (size_t rank = 0; rank < n; rank++)
                 params.tau[order[rank]] = tau_samples[rank];
@@ -370,6 +690,28 @@ public:
             }
             break;
         }
+        case QAssignMode::EXPONENTIAL:
+        {
+            // Truncated exponential on [0,1]: f(q) propto exp(-q / scale).
+            const double scale = (config.q_exponential_scale > 0.0)
+                ? config.q_exponential_scale
+                : 1.0;
+            const double trunc_mass = 1.0 - std::exp(-1.0 / scale);
+            for (size_t i = 0; i < n; i++)
+            {
+                const double u = dsfmt_gv_genrand_open_open();
+                params.q[i] = -scale * std::log(1.0 - u * trunc_mass);
+            }
+            break;
+        }
+        case QAssignMode::UNIRAND:
+            for (size_t i = 0; i < n; i++)
+            {
+                const double u = dsfmt_gv_genrand_close_open();
+                params.q[i] = clampUnitInterval(
+                    config.q_unirand_lo + u * (config.q_unirand_hi - config.q_unirand_lo));
+            }
+            break;
         }
     }
 

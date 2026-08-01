@@ -1,6 +1,15 @@
 #pragma once
+#include <unordered_map>
 /// Node list
 typedef std::vector<uint32_t> Nodelist;
+/// Sparse forward adjacency: only nodes with out-edges appear as keys.
+using FrimSparseFwdAdj = std::unordered_map<uint32_t, std::vector<uint32_t>>;
+/// Sparse per-node byte flags (xi_active, reachability, Tarjan marks).
+using FrimByteMap = std::unordered_map<uint32_t, uint8_t>;
+/// Sparse per-node int state (Tarjan disc/low/parent).
+using FrimIntMap = std::unordered_map<uint32_t, int>;
+/// CRN xi coins in [0,1] for nodes in an RR-graph sample.
+using FrimXiGateMap = std::unordered_map<uint32_t, float>;
 /// Edge structure, neighbor id and the edge weight
 typedef std::pair<uint32_t, float> Edge;
 /// Edgelist structure from one source/target node
@@ -42,15 +51,37 @@ struct FrimRRSample
     std::vector<uint32_t> rr_nodes;
 };
 
-/// CRN RR structure: reverse BFS tree without xi filtering; xi_gate fixed per node.
+/// RR sample with full forward edge list on the sampled RR-graph (for K / Tarjan).
+struct FrimRRGraphSample
+{
+    uint32_t root = 0;
+    /// Virtual seed id (= numV) used only for Tarjan; not stored in nodes/adj.
+    uint32_t platform_id = UINT32_MAX;
+    bool hit = false;
+    /// q-hit seed nodes recorded during reverse BFS.
+    std::vector<uint32_t> hit_nodes;
+    std::vector<uint32_t> nodes;
+    /// Forward live edges pred -> u within the RR set.
+    FrimSparseFwdAdj forward_adj;
+    /// CRN xi coins in [0,1] for nodes in this RR-graph (sparse; root omitted).
+    FrimXiGateMap xi_gate;
+};
+
+/// CRN RR structure: full reverse-BFS subgraph + fixed xi_gate per node.
 struct FrimRRStructureSample
 {
     uint32_t root = 0;
     bool hit = false;
+    /// First q-hit node (dequeue order); kept for logging / legacy.
     uint32_t hit_node = 0;
-    std::vector<uint32_t> bfs_order;
-    std::vector<uint32_t> parent;
-    std::vector<float> xi_gate;
+    /// All q-hit nodes; q-hit stops expansion at u only, BFS continues elsewhere.
+    std::vector<uint32_t> hit_nodes;
+    /// All nodes in the sampled RR subgraph.
+    std::vector<uint32_t> nodes;
+    /// Live forward edges (pred -> u) within the RR subgraph.
+    FrimSparseFwdAdj forward_adj;
+    /// CRN xi coins in [0,1] for nodes in this subgraph (sparse; root omitted or 0).
+    FrimXiGateMap xi_gate;
 };
 
 /// Runtime stats for a FRIM solve run (written to result/info).
@@ -77,7 +108,7 @@ typedef std::vector<uint32_t> RRset;
 typedef std::vector<RRset> RRsets;
 bool optflag;
 enum ProbDist {WEIGHTS, UNIFORM, WC, WC2, SKEWED, PROB_DIST_ERROR};
-enum FuncType {FORMAT, IM, FUNC_ERROR, WIM, SUBSIM, OUTDEG, PROB, RAND, AIS, ScaLIM, ADIL, GREEDY, CHANGE_PROB, DG, EVAL, PREP_CAND, STAT, FRIM_RR, FRIM_RR_NAIVE, FRIM_RR_CRN, FRIM_MC, FRIM_MC_NAIVE};
+enum FuncType {FORMAT, HYP_DERIVE, IM, FUNC_ERROR, WIM, SUBSIM, OUTDEG, PROB, RAND, AIS, ScaLIM, ADIL, GREEDY, CHANGE_PROB, DG, EVAL, PREP_CAND, STAT, FRIM_RR, FRIM_RR_NAIVE, FRIM_RR_GRAPH, FRIM_RR_GRAPH_PRUNE, FRIM_RR_GRAPH_ROOT_STAT, FRIM_SUBSIM, FRIM_PRUNE, FRIM_PRUNE_LO, FRIM_PRUNE_BOTH, FRIM_MC_CRN, FRIM_MC_NAIVE, FRIM_OUTNAME};
 /// Weighted RR root sampling mode for subsimW (-func=wim)
 enum WRRSampleMode { WRR_INDEG, WRR_WINDEG, WRR_WOUTDEG, WRR_OUTDEG, WRR_UNIFORM, WRR_SAMPLE_ERROR };
 enum CascadeModel { IC, LT };

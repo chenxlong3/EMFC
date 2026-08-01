@@ -550,7 +550,7 @@ public:
     }
 
     /// Reverse BFS RR-set: root skips xi; other nodes draw xi once per sample (cached);
-    /// xi-fail nodes are never enqueued; q hit stops.
+    /// xi-fail nodes are never enqueued; q-hit at u skips expanding u but BFS continues.
     FrimRRSample BuildOneFrimRRSample(
         const uint32_t v_root,
         const std::vector<double>& q,
@@ -595,7 +595,7 @@ public:
             if (u < q.size() && dsfmt_gv_genrand_open_close() <= q[u])
             {
                 sample.hit = true;
-                break;
+                continue;
             }
 
             for (const auto& nbr : _graph[u])
@@ -616,24 +616,31 @@ public:
         return sample;
     }
 
-    /// Reverse BFS without xi: save tree + per-node xi_gate for CRN re-evaluation.
-    FrimRRStructureSample BuildOneFrimRRStructure(
+    /// Reverse BFS at xi=1; record q-hit seeds. q-hit at u: no expand u, BFS continues.
+    FrimRRGraphSample BuildOneFrimRRGraphSample(
         const uint32_t v_root,
         const std::vector<double>& q) const
     {
-        FrimRRStructureSample sample;
+        FrimRRGraphSample sample;
         sample.root = v_root;
+        sample.platform_id = _numV;
         sample.hit = false;
-        sample.hit_node = 0;
-        sample.parent.assign(_numV, UINT32_MAX);
-        sample.xi_gate.assign(_numV, -1.0f);
+        sample.hit_nodes.clear();
+        sample.nodes.clear();
+        sample.forward_adj.clear();
 
-        std::vector<uint8_t> visited(_numV, 0);
+        std::unordered_set<uint32_t> visited;
+        std::unordered_set<uint32_t> in_rr_set;
         std::queue<uint32_t> bfs_q;
 
-        visited[v_root] = 1;
-        sample.xi_gate[v_root] = 0.0f;
-        sample.bfs_order.push_back(v_root);
+        auto markInRR = [&](uint32_t x)
+        {
+            if (in_rr_set.insert(x).second)
+                sample.nodes.push_back(x);
+        };
+
+        visited.insert(v_root);
+        markInRR(v_root);
         bfs_q.push(v_root);
 
         while (!bfs_q.empty())
@@ -644,22 +651,188 @@ public:
             if (u < q.size() && dsfmt_gv_genrand_open_close() <= q[u])
             {
                 sample.hit = true;
-                sample.hit_node = u;
-                break;
+                sample.hit_nodes.push_back(u);
+                continue;
             }
 
             for (const auto& nbr : _graph[u])
             {
                 const uint32_t pred = nbr.first;
-                if (visited[pred])
-                    continue;
                 if (dsfmt_gv_genrand_open_close() > nbr.second)
                     continue;
 
-                visited[pred] = 1;
-                sample.parent[pred] = u;
-                sample.xi_gate[pred] = static_cast<float>(dsfmt_gv_genrand_close_open());
-                sample.bfs_order.push_back(pred);
+                sample.forward_adj[pred].push_back(u);
+                markInRR(pred);
+                markInRR(u);
+
+                if (visited.count(pred))
+                    continue;
+
+                visited.insert(pred);
+                bfs_q.push(pred);
+            }
+        }
+
+        return sample;
+    }
+
+    /// RR-graph at xi=1 live edges; store fixed xi_gate per node for CRN re-evaluation.
+    FrimRRGraphSample BuildOneFrimRRGraphSampleCrn(
+        const uint32_t v_root,
+        const std::vector<double>& q) const
+    {
+        FrimRRGraphSample sample = BuildOneFrimRRGraphSample(v_root, q);
+        sample.xi_gate.clear();
+        for (uint32_t u : sample.nodes)
+        {
+            if (u == sample.root)
+                continue;
+            sample.xi_gate[u] = static_cast<float>(dsfmt_gv_genrand_close_open());
+        }
+        return sample;
+    }
+
+    /// RR-graph sample with xi gating. q-hit at u: no expand u, BFS continues.
+    FrimRRGraphSample BuildOneFrimRRGraphSampleWithXi(
+        const uint32_t v_root,
+        const std::vector<double>& q,
+        const std::vector<double>& xi) const
+    {
+        FrimRRGraphSample sample;
+        sample.root = v_root;
+        sample.platform_id = _numV;
+        sample.hit = false;
+        sample.hit_nodes.clear();
+        sample.nodes.clear();
+        sample.forward_adj.clear();
+
+        std::unordered_set<uint32_t> visited;
+        std::unordered_set<uint32_t> in_rr_set;
+        std::unordered_map<uint32_t, int8_t> xi_pass;
+        std::queue<uint32_t> bfs_q;
+
+        auto markInRR = [&](uint32_t x)
+        {
+            if (in_rr_set.insert(x).second)
+                sample.nodes.push_back(x);
+        };
+
+        auto resolveXiPass = [&](uint32_t node) -> bool
+        {
+            if (node == v_root)
+                return true;
+            if (node >= xi.size())
+                return false;
+            const auto cached = xi_pass.find(node);
+            if (cached != xi_pass.end())
+                return cached->second == 1;
+            const bool pass = dsfmt_gv_genrand_close_open() <= xi[node];
+            xi_pass[node] = pass ? 1 : 0;
+            return pass;
+        };
+
+        visited.insert(v_root);
+        markInRR(v_root);
+        bfs_q.push(v_root);
+
+        while (!bfs_q.empty())
+        {
+            const uint32_t u = bfs_q.front();
+            bfs_q.pop();
+
+            if (u != v_root && !resolveXiPass(u))
+                continue;
+
+            if (u < q.size() && dsfmt_gv_genrand_open_close() <= q[u])
+            {
+                sample.hit = true;
+                sample.hit_nodes.push_back(u);
+                continue;
+            }
+
+            for (const auto& nbr : _graph[u])
+            {
+                const uint32_t pred = nbr.first;
+                if (dsfmt_gv_genrand_open_close() > nbr.second)
+                    continue;
+                if (pred != v_root && !resolveXiPass(pred))
+                    continue;
+
+                sample.forward_adj[pred].push_back(u);
+                markInRR(pred);
+                markInRR(u);
+
+                if (visited.count(pred))
+                    continue;
+
+                visited.insert(pred);
+                bfs_q.push(pred);
+            }
+        }
+
+        return sample;
+    }
+
+    /// Full RR subgraph: all live edges kept (not a BFS tree). q-hit at u: no expand u, BFS continues.
+    /// xi_gate sampled once per node when first added to the subgraph.
+    FrimRRStructureSample BuildOneFrimRRStructure(
+        const uint32_t v_root,
+        const std::vector<double>& q) const
+    {
+        FrimRRStructureSample sample;
+        sample.root = v_root;
+        sample.hit = false;
+        sample.hit_node = 0;
+        sample.hit_nodes.clear();
+        sample.nodes.clear();
+        sample.forward_adj.clear();
+        sample.xi_gate.clear();
+
+        std::unordered_set<uint32_t> visited;
+        std::unordered_set<uint32_t> in_rr_set;
+        std::queue<uint32_t> bfs_q;
+
+        auto markInRR = [&](uint32_t x)
+        {
+            if (in_rr_set.insert(x).second)
+                sample.nodes.push_back(x);
+        };
+
+        visited.insert(v_root);
+        markInRR(v_root);
+        sample.xi_gate[v_root] = 0.0f;
+        bfs_q.push(v_root);
+
+        while (!bfs_q.empty())
+        {
+            const uint32_t u = bfs_q.front();
+            bfs_q.pop();
+
+            if (u < q.size() && dsfmt_gv_genrand_open_close() <= q[u])
+            {
+                sample.hit = true;
+                sample.hit_nodes.push_back(u);
+                if (sample.hit_nodes.size() == 1)
+                    sample.hit_node = u;
+                continue;
+            }
+
+            for (const auto& nbr : _graph[u])
+            {
+                const uint32_t pred = nbr.first;
+                if (dsfmt_gv_genrand_open_close() > nbr.second)
+                    continue;
+
+                sample.forward_adj[pred].push_back(u);
+                markInRR(pred);
+                markInRR(u);
+
+                if (visited.count(pred))
+                    continue;
+
+                visited.insert(pred);
+                sample.xi_gate[pred] =
+                    static_cast<float>(dsfmt_gv_genrand_close_open());
                 bfs_q.push(pred);
             }
         }

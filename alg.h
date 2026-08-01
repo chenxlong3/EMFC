@@ -17,8 +17,39 @@ struct FrimXiResult
     double J_method_mc = 0.0;
     double J_method_mc_naive = 0.0;
     double J_method_rr_naive = 0.0;
-    double J_method_rr_crn = 0.0;
+    double J_method_rr_graph = 0.0;
     FrimRunInfo run_info;
+};
+
+/// K-L gradient prune analysis at xi ≡ 1 (L_ub = lam_u * q-hit count at xi≡1, root u).
+struct FrimPruneResult
+{
+    std::vector<double> K;
+    std::vector<double> K_lb;
+    std::vector<double> L_ub;
+    std::vector<double> alpha_lb;
+    std::vector<uint8_t> pruned_to_one;
+    size_t num_pruned = 0;
+    size_t num_uncertain = 0;
+    size_t num_rr = 0;
+    double tau_sum = 0.0;
+    double hoeffding_margin = 0.0;
+};
+
+/// K upper / L lower prune analysis at xi ≡ xi_lo (L_lb = lam_u * q-hit count at xi≡xi_lo, root u).
+struct FrimPruneLoResult
+{
+    std::vector<double> K;
+    std::vector<double> K_ub;
+    std::vector<double> L_lb;
+    std::vector<double> alpha_ub;
+    std::vector<uint8_t> pruned_to_lo;
+    size_t num_pruned = 0;
+    size_t num_uncertain = 0;
+    size_t num_rr = 0;
+    double tau_sum = 0.0;
+    double hoeffding_margin = 0.0;
+    double xi_lo = 0.5;
 };
 
 class Alg
@@ -147,6 +178,14 @@ private:
         const std::vector<double>& tau,
         const std::vector<double>& lam,
         const std::vector<double>& xi) const;
+    double frimEstimateBenefitJ(
+        const Graph& forwardGraph,
+        const std::vector<double>& xi,
+        const std::vector<double>& q,
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        CascadeModel model,
+        size_t num_mc) const;
     FrimXiResult frimMethodMCNaive(
         const Graph& forwardGraph,
         const std::vector<double>& tau,
@@ -156,7 +195,8 @@ private:
         double xi_lo,
         size_t num_mc,
         int max_sweeps,
-        double delta_tol) const;
+        double delta_tol,
+        CascadeModel model) const;
     FrimXiResult frimMethodRRNaive(
         const std::vector<double>& tau,
         const std::vector<double>& lam,
@@ -173,6 +213,28 @@ private:
         size_t num_rr,
         const std::vector<double>& tau,
         const std::vector<double>& q) const;
+    std::vector<FrimRRSample> frimBuildTauRootRRSamplesAtXiOne(
+        size_t num_rr,
+        const std::vector<double>& tau,
+        const std::vector<double>& q) const;
+    std::vector<FrimRRGraphSample> frimBuildTauRootRRGraphSamplesAtXiOne(
+        size_t num_rr,
+        const std::vector<double>& tau,
+        const std::vector<double>& q) const;
+    std::vector<FrimRRGraphSample> frimBuildTauRootRRGraphSamples(
+        size_t num_rr,
+        const std::vector<double>& tau,
+        const std::vector<double>& q,
+        const std::vector<double>& xi) const;
+    std::vector<FrimRRGraphSample> frimBuildTauRootRRGraphSamplesCrn(
+        size_t num_rr,
+        const std::vector<double>& tau,
+        const std::vector<double>& q,
+        bool store_hit_only = true,
+        size_t* num_discarded_out = nullptr) const;
+    static bool frimRRGraphNodeBlocks(
+        const FrimRRGraphSample& sample,
+        uint32_t u);
     static double frimRRStructureSampleWeight(
         const FrimRRStructureSample& sample,
         const std::vector<double>& xi,
@@ -185,7 +247,7 @@ private:
         const std::vector<double>& xi,
         const std::vector<double>& tau,
         const std::vector<double>& lam) const;
-    FrimXiResult frimMethodRRCrn(
+    FrimXiResult frimMethodRRGraph(
         const std::vector<double>& tau,
         const std::vector<double>& lam,
         const std::vector<double>& q,
@@ -193,7 +255,15 @@ private:
         double xi_lo,
         size_t num_rr,
         int max_sweeps,
-        double delta_tol);
+        double delta_tol,
+        bool combined_prune_init = false,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05,
+        double hoeffding_margin_scale = 1.0,
+        double hoeffding_margin_override = -1.0,
+        bool rr_graph_gate_sweep_index = true,
+        bool store_hit_only = true,
+        const std::vector<uint32_t>* subsim_fix_one = nullptr);
     // ===== end FRIM xi selection =====
 
 public:
@@ -258,7 +328,7 @@ public:
         double xi_lo = 0.5,
         size_t num_rr = 10000);
 
-    /// Naive RR: each sweep re-estimates J with xi_u in {xi_lo, 1} (fresh R per estimate).
+    /// Naive RR: J_stay vs J_flip (one frimEstimateJ each); J_hat = J_flip on accept.
     FrimXiResult frim_solve_rr_naive(
         const std::vector<double>& tau,
         const std::vector<double>& lam,
@@ -269,8 +339,8 @@ public:
         int max_sweeps = 10,
         double delta_tol = 1e-9);
 
-    /// CRN RR: tau-root structural samples reused; per-node {xi_lo,1} via fixed xi_gate coins.
-    FrimXiResult frim_solve_rr_crn(
+    /// RR-graph: tau-root structural samples reused; per-node {xi_lo,1} via fixed xi_gate coins.
+    FrimXiResult frim_solve_rr_graph(
         const std::vector<double>& tau,
         const std::vector<double>& lam,
         const std::vector<double>& q,
@@ -278,7 +348,110 @@ public:
         double xi_lo = 0.5,
         size_t num_rr = 1000,
         int max_sweeps = 10,
-        double delta_tol = 1e-9);
+        double delta_tol = 1e-9,
+        bool rr_graph_gate_sweep_index = true,
+        bool store_hit_only = true);
+
+    /// Count tau-root assignments over R RR-graph sampling attempts; print min/max stats.
+    void frimStatAndPrintRRGraphRootCounts(
+        size_t num_rr,
+        const std::vector<double>& tau,
+        const std::vector<double>& q,
+        bool store_hit_only,
+        bool build_rr_graphs) const;
+
+    /// SubSim heuristic: top-(n/100) IM seeds get xi=1, rest xi=xi_lo; no FRIM estimate.
+    FrimXiResult frim_solve_subsim(
+        double xi_lo = 0.5,
+        double subsim_eps = 0.5,
+        double subsim_delta = 0.0);
+
+    /// RR-graph + combined K/L prune init; sweep only non-fixed nodes.
+    FrimXiResult frim_solve_rr_graph_prune(
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        const std::vector<double>& xi_init,
+        double xi_lo = 0.5,
+        size_t num_rr = 1000,
+        int max_sweeps = 10,
+        double delta_tol = 1e-9,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05,
+        double hoeffding_margin_scale = 1.0,
+        double hoeffding_margin_override = -1.0,
+        bool rr_graph_gate_sweep_index = true,
+        bool store_hit_only = true);
+
+    /// At xi≡1: K_lb from xi_lo pass-through/block samples; L_ub=lam*hit count; prune if K_lb-L_ub>0.
+    FrimPruneResult frimAnalyzeKMinusLPrune(
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        double xi_lo,
+        size_t num_rr,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05) const;
+
+    FrimPruneResult frimAnalyzeKMinusLPruneFromSamples(
+        const std::vector<FrimRRGraphSample>& samples,
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        double xi_lo,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05,
+        double hoeffding_margin_scale = 1.0,
+        double hoeffding_margin_override = -1.0) const;
+
+    void frimRunKMinusLPruneAnalysis(
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        double xi_lo,
+        size_t num_rr,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05) const;
+
+    /// At xi≡xi_lo: K_ub excludes pass-through samples; L_lb=lam*hit count at xi≡xi_lo; prune if K_ub-L_lb<0.
+    FrimPruneLoResult frimAnalyzeKUbLlbAtXiLo(
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        double xi_lo,
+        size_t num_rr,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05) const;
+
+    FrimPruneLoResult frimAnalyzeKUbLlbAtXiLoFromSamples(
+        const std::vector<FrimRRGraphSample>& samples,
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        double xi_lo,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05,
+        double hoeffding_margin_scale = 1.0,
+        double hoeffding_margin_override = -1.0) const;
+
+    void frimRunKUbLlbPruneAnalysis(
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        double xi_lo,
+        size_t num_rr,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05) const;
+
+    void frimRunCombinedPruneAnalysis(
+        const std::vector<double>& tau,
+        const std::vector<double>& lam,
+        const std::vector<double>& q,
+        double xi_lo,
+        size_t num_rr,
+        int rand_seed,
+        double eps = 0.1,
+        double hoeffding_delta = 0.05) const;
 
     /// RR J_hat at fixed xi (resamples num_rr sets).
     double frim_estimate_j_at_xi(
@@ -297,8 +470,8 @@ public:
         const std::vector<double>& lam,
         size_t num_mc) const;
 
-    /// FRIM MC method: CRN live-edge coordinate ascent.
-    FrimXiResult frim_solve_mc(
+    /// FRIM MC-CRN: CRN live-edge coordinate ascent.
+    FrimXiResult frim_solve_mc_crn(
         const Graph& forwardGraph,
         const std::vector<double>& tau,
         const std::vector<double>& lam,
@@ -309,7 +482,7 @@ public:
         int max_sweeps = 10,
         double delta_tol = 1e-9);
 
-    /// Naive MC: resample live-edge graphs each sweep; full BFS per flip test.
+    /// Naive MC: one benefit_inf_eval each for J_stay and J_flip; J_hat = J_flip on accept.
     FrimXiResult frim_solve_mc_naive(
         const Graph& forwardGraph,
         const std::vector<double>& tau,
@@ -319,7 +492,8 @@ public:
         double xi_lo = 0.5,
         size_t num_mc = 1000,
         int max_sweeps = 10,
-        double delta_tol = 1e-9);
+        double delta_tol = 1e-9,
+        CascadeModel model = IC);
 };
 
 using TAlg = Alg;
