@@ -434,24 +434,24 @@ public:
     }
 
     /// RR-graph sample count: fixed -frim_rr, or
-    /// ceil((8+2*eps)*T*(log(1/delta)+n*log(2)+log(2))/(eps^2*n))
-    /// where T = tau_sum (falls back to n when tau_sum <= 0),
-    /// delta = (user delta or 1/n) / 2.
+    /// ceil((8+2*eps)*(log(1/delta)+n*log(2)+log(2))/eps^2)
+    /// where delta = (user delta or 1/n) / 2.
+    /// tau_sum is accepted for API compatibility but unused by this formula.
     size_t resolveFrimRRGraphNumSamples(size_t num_v, double tau_sum = -1.0) const
     {
+        (void)tau_sum;
         if (_frim_rr_fixed)
             return _frim_rr;
         if (_eps <= 0.0 || num_v == 0)
             return std::max<size_t>(1, _frim_rr);
         const double n = static_cast<double>(num_v);
-        const double T = (tau_sum > 0.0) ? tau_sum : n;
         const double base_delta = (_delta > 0.0) ? _delta : (1.0 / n);
         const double delta = base_delta / 2.0;
         const double eps2 = _eps * _eps;
         const double log_term =
             std::log(1.0 / delta) + n * std::log(2.0) + std::log(2.0);
         const double num_rr =
-            (8.0 + 2.0 * _eps) * T * log_term / (eps2 * n);
+            (8.0 + 2.0 * _eps) * log_term / eps2;
         return std::max<size_t>(1, static_cast<size_t>(std::ceil(num_rr)));
     }
 

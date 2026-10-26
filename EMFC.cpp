@@ -21,9 +21,8 @@ static size_t frimResolveRRGraphNumRR(TArgument& Arg, size_t num_v, double tau_s
         const double base_delta = (Arg._delta > 0.0) ? Arg._delta : (1.0 / n);
         const double delta = base_delta / 2.0;
         std::cout << tag
-                  << " num_rr = (8+2*eps)*T*(log(1/delta)+n*log(2)+log(2))/(eps^2*n): n="
+                  << " num_rr = (8+2*eps)*(log(1/delta)+n*log(2)+log(2))/eps^2: n="
                   << num_v
-                  << " T=" << tau_sum
                   << " delta=" << delta
                   << " eps=" << Arg._eps
                   << " -> R=" << num_rr << std::endl;

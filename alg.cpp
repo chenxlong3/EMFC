@@ -1,5 +1,10 @@
 #include "stdafx.h"
 
+// If 1: K_lb counts u only when B(u), xi_gate(u)>xi_lo, and single-flip q-hit.
+#ifndef FRIM_K_LB_GATE_XILO
+#define FRIM_K_LB_GATE_XILO 0
+#endif
+
 // code from OPIM
 double Alg::MaxCoverVanilla(const int targetSize)
 {
@@ -2481,6 +2486,18 @@ static void frimRRGraphPrepareBlocksXi1(const FrimRRGraphSample& sample)
     frimRRGraphRunBlockPipeline(sample, g_blocks_xi1, g_xi_active);
 }
 
+/// CRN gate at u on sample R; xi_gate stored at xi≡1 sampling time.
+static bool frimRRGraphNodeXiGateAboveXiLo(
+    const FrimRRGraphSample& sample,
+    uint32_t u,
+    double xi_lo)
+{
+    const auto gate_it = sample.xi_gate.find(u);
+    if (gate_it == sample.xi_gate.end())
+        return false;
+    return static_cast<double>(gate_it->second) > xi_lo + 1e-15;
+}
+
 static void frimAccumulateKLBPruneFromSamples(
     const std::vector<FrimRRGraphSample>& samples,
     const std::vector<double>& lam,
@@ -2510,10 +2527,11 @@ static void frimAccumulateKLBPruneFromSamples(
             (*hit_root_xilo)[v] += 1.0;
 
         // K as ∂J/∂xi_u: no xi_lo pass-through filter.
-        // K_lb: Tarjan blocks at ξ≡1, count u only if q still hits when
-        //       ξ_v=ξ_lo (∀v≠u) and ξ_u=1 (single-flip q-hit).
-        // K_ub: all q-hit samples containing u (GRRG non-empty ⇒ q-hit at ξ=1),
-        //       weight (1-λ_root·ξ_lo).
+        // K_lb: Tarjan blocks at ξ≡1 (CRN xi_gate), then for u≠v:
+        //   default: B(u) && single-flip q-hit (ξ_u=1, ξ_{-u}=ξ_lo).
+        //   FRIM_K_LB_GATE_XILO: also require xi_gate(u)>xi_lo
+        //     (equiv. I_R(1^{u←ξ_lo})=0 before flip; flip test ⇒ I_R(ℓ^{u←1})=1).
+        // K_ub: all q-hit samples containing u, weight (1-λ_root·ξ_lo).
         if (k_lb_accum)
             frimRRGraphPrepareBlocksXi1(sample);
 
@@ -2525,6 +2543,9 @@ static void frimAccumulateKLBPruneFromSamples(
                 continue;
 
             if (k_lb_accum && frimByteMapGet(g_blocks_xi1, u)
+#if FRIM_K_LB_GATE_XILO
+                && frimRRGraphNodeXiGateAboveXiLo(sample, u, xi_lo)
+#endif
                 && frimRRGraphSampleQHitXiLoExceptOne(sample, xi_lo, u))
                 (*k_lb_accum)[u] += coef_lb;
             if (k_ub_accum)
@@ -2533,11 +2554,22 @@ static void frimAccumulateKLBPruneFromSamples(
     }
 }
 
+static double frimPruneLBoundXiFactor(double xi_lo)
+{
+#if FRIM_K_LB_GATE_XILO
+    return std::max(0.0, 1.0 - xi_lo);
+#else
+    (void)xi_lo;
+    return 1.0;
+#endif
+}
+
 static void frimFinalizeKMinusLPrune(
     FrimPruneResult& out,
     const std::vector<double>& lam,
     const std::vector<double>& hit_root_xi1,
-    double scale)
+    double scale,
+    double xi_lo)
 {
     out.K_lb = out.K;
     out.L_ub.assign(out.K.size(), 0.0);
@@ -2546,9 +2578,10 @@ static void frimFinalizeKMinusLPrune(
     out.num_pruned = 0;
     out.num_uncertain = 0;
 
+    const double l_factor = frimPruneLBoundXiFactor(xi_lo);
     for (size_t u = 0; u < out.K.size(); u++)
     {
-        out.L_ub[u] = lam[u] * hit_root_xi1[u] * scale;
+        out.L_ub[u] = lam[u] * hit_root_xi1[u] * scale * l_factor;
         out.alpha_lb[u] = out.K_lb[u] - out.L_ub[u];
         if (out.alpha_lb[u] > 0.0)
         {
@@ -2566,7 +2599,8 @@ static void frimFinalizeKUbLlbPrune(
     FrimPruneLoResult& out,
     const std::vector<double>& lam,
     const std::vector<double>& hit_root_xilo,
-    double scale)
+    double scale,
+    double xi_lo)
 {
     out.K_ub = out.K;
     out.L_lb.assign(out.K.size(), 0.0);
@@ -2575,9 +2609,10 @@ static void frimFinalizeKUbLlbPrune(
     out.num_pruned = 0;
     out.num_uncertain = 0;
 
+    const double l_factor = frimPruneLBoundXiFactor(xi_lo);
     for (size_t u = 0; u < out.K.size(); u++)
     {
-        out.L_lb[u] = lam[u] * hit_root_xilo[u] * scale;
+        out.L_lb[u] = lam[u] * hit_root_xilo[u] * scale * l_factor;
         out.alpha_ub[u] = out.K_ub[u] - out.L_lb[u];
         if (out.alpha_ub[u] < 0.0)
         {
@@ -2654,8 +2689,8 @@ static void frimAnalyzeCombinedKLBFromSamples(
         lo.K[u] *= scale;
     }
 
-    frimFinalizeKMinusLPrune(hi, lam, hit_root_xi1, scale);
-    frimFinalizeKUbLlbPrune(lo, lam, hit_root_xilo, scale);
+    frimFinalizeKMinusLPrune(hi, lam, hit_root_xi1, scale, xi_lo);
+    frimFinalizeKUbLlbPrune(lo, lam, hit_root_xilo, scale, xi_lo);
 }
 
 } // namespace
@@ -2744,7 +2779,7 @@ FrimPruneResult Alg::frimAnalyzeKMinusLPruneFromSamples(
     for (size_t u = 0; u < _numV; u++)
         out.K[u] *= scale;
 
-    frimFinalizeKMinusLPrune(out, lam, hit_root_xi1, scale);
+    frimFinalizeKMinusLPrune(out, lam, hit_root_xi1, scale, xi_lo);
 
     /*
     // --- previous bound (kept for reference) ---
@@ -2887,7 +2922,7 @@ FrimPruneLoResult Alg::frimAnalyzeKUbLlbAtXiLoFromSamples(
     for (size_t u = 0; u < _numV; u++)
         out.K[u] *= scale;
 
-    frimFinalizeKUbLlbPrune(out, lam, hit_root_xilo, scale);
+    frimFinalizeKUbLlbPrune(out, lam, hit_root_xilo, scale, xi_lo);
 
     /*
     // --- previous bound (kept for reference) ---
@@ -4314,6 +4349,9 @@ FrimXiResult Alg::frim_solve_rr_graph_prune(
 
     std::cout << "[FRIM-RR-GRAPH-PRUNE] combined K/L prune init + J sweep, R="
               << num_rr << ", max_sweeps=" << max_sweeps
+#if FRIM_K_LB_GATE_XILO
+              << ", K_lb=blocks+xi_gate>xi_lo+single_flip"
+#endif
               << ", hoeffding_delta=" << hoeffding_delta;
     if (hoeffding_margin_override >= 0.0)
         std::cout << ", hoeffding_margin=" << hoeffding_margin_override << " (fixed)";
